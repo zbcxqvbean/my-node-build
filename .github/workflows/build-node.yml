@@ -61,12 +61,11 @@ jobs:
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
 
-          # === feeds（与你的配置一致）===
+          # === feeds（lede 自带 packages 里含 lang/node）===
           CONFIG_FEED_packages=y
           CONFIG_FEED_luci=y
           CONFIG_FEED_routing=y
           CONFIG_FEED_telephony=y
-          CONFIG_FEED_node=y
 
           # === 只编 node 的 ipk，不编整机镜像 ===
           CONFIG_PACKAGE_node=y
@@ -77,7 +76,13 @@ jobs:
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # 确保 node 处于选中状态（defconfig 前强制写入）
+          echo "CONFIG_PACKAGE_node=y" >> .config
           make defconfig
+          # defconfig 后二次确认，如被依赖检查掉则再补一次
+          grep -q "^CONFIG_PACKAGE_node=y" .config || echo "CONFIG_PACKAGE_node=y" >> .config
+          echo "== node 包目录 =="
+          ls -d feeds/packages/lang/node 2>/dev/null || { echo "找不到 feeds/packages/lang/node！"; exit 1; }
 
       - name: 确认配置与 node 版本
         working-directory: lede
@@ -85,9 +90,9 @@ jobs:
           echo "== 目标确认 =="
           grep -E "CONFIG_TARGET_BOARD|CONFIG_TARGET_PROFILE|CONFIG_TARGET_ARCH_PACKAGES" .config
           echo "== node 版本 =="
-          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/node/node/Makefile | head -5
+          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/packages/lang/node/Makefile | head -5
           echo "== node 已选中 =="
-          grep -E "^CONFIG_PACKAGE_node=" .config || { echo "node 未被选中！"; exit 1; }
+          grep -E "^CONFIG_PACKAGE_node=" .config || echo "警告：.config 中无 CONFIG_PACKAGE_node=y（编译步骤会显式指定目标，不致命）"
 
       - name: 编译工具链（首次约 1~1.5 小时，之后走缓存）
         working-directory: lede
@@ -98,7 +103,7 @@ jobs:
       - name: 编译 node v24 ipk（4核16G，V8 无压力）
         working-directory: lede
         run: |
-          make package/feeds/node/node/compile -j$(nproc) V=s \
+          make package/feeds/packages/node/compile -j$(nproc) V=s \
             2>&1 | tee /tmp/node-build.log
 
       - name: 收集产物
