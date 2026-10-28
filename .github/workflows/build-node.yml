@@ -1,0 +1,125 @@
+name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+
+on:
+  workflow_dispatch:      # 手动触发
+    inputs:
+      lede_ref:
+        description: "lede 分支或 commit（留空 = master）"
+        required: false
+        default: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gettext git libncurses-dev libz-dev swig python3 python3-distutils \
+            python3-setuptools rsync unzip time wget curl xxd file
+
+      - name: 拉取 coolsnowwolf/lede 源码
+        run: |
+          git clone --depth 1 \
+            https://github.com/coolsnowwolf/lede.git lede
+          cd lede
+          # 如果指定了具体 ref，checkout 锁定版本
+          if [ -n "${{ github.event.inputs.lede_ref }}" ] \
+             && [ "${{ github.event.inputs.lede_ref }}" != "master" ]; then
+            git fetch --depth 1 origin ${{ github.event.inputs.lede_ref }}
+            git checkout ${{ github.event.inputs.lede_ref }}
+          fi
+          echo "== lede HEAD ==" && git log -1 --format="%H %cd"
+
+      # —— 缓存：dl 下载 + toolchain 编译产物。首次约 1~1.5h，之后 30 分钟内完成 ——
+      - name: 缓存 dl
+        uses: actions/cache@v4
+        with:
+          path: lede/dl
+          key: lede-dl-ipq40xx-${{ hashFiles('lede/include/kernel-version.mk') }}
+          restore-keys: lede-dl-ipq40xx-
+
+      - name: 缓存 toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            lede/staging_dir
+            lede/toolchain
+          key: lede-tc-ipq40xx-${{ hashFiles('lede/include/kernel-version.mk') }}-${{ github.event.inputs.lede_ref }}
+          restore-keys: lede-tc-ipq40xx-
+
+      # —— 按你的 .config 精确还原目标：ipq40xx generic + ASUS RT-AC42U + node ——
+      - name: 生成 .config（你的目标配置）
+        working-directory: lede
+        run: |
+          cat > .config <<'EOF'
+          # === 目标：ipq40xx / ASUS RT-AC42U ===
+          CONFIG_TARGET_ipq40xx=y
+          CONFIG_TARGET_ipq40xx_generic=y
+          CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
+
+          # === feeds（与你的配置一致）===
+          CONFIG_FEED_packages=y
+          CONFIG_FEED_luci=y
+          CONFIG_FEED_routing=y
+          CONFIG_FEED_telephony=y
+          CONFIG_FEED_node=y
+
+          # === 只编 node 的 ipk，不编整机镜像 ===
+          CONFIG_PACKAGE_node=y
+          EOF
+
+      - name: 更新并安装 feeds
+        working-directory: lede
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+
+      - name: 确认配置与 node 版本
+        working-directory: lede
+        run: |
+          echo "== 目标确认 =="
+          grep -E "CONFIG_TARGET_BOARD|CONFIG_TARGET_PROFILE|CONFIG_TARGET_ARCH_PACKAGES" .config
+          echo "== node 版本 =="
+          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/node/node/Makefile | head -5
+          echo "== node 已选中 =="
+          grep -E "^CONFIG_PACKAGE_node=" .config || { echo "node 未被选中！"; exit 1; }
+
+      - name: 编译工具链（首次约 1~1.5 小时，之后走缓存）
+        working-directory: lede
+        run: |
+          make tools/install -j$(nproc) V=s
+          make toolchain/install -j$(nproc) V=s
+
+      - name: 编译 node v24 ipk（4核16G，V8 无压力）
+        working-directory: lede
+        run: |
+          make package/feeds/node/node/compile -j$(nproc) V=s \
+            2>&1 | tee /tmp/node-build.log
+
+      - name: 收集产物
+        working-directory: lede
+        run: |
+          mkdir -p out
+          find bin/packages bin/targets \
+            \( -name "node_*.ipk" -o -name "node-*.ipk" -o -name "libnode*.ipk" \) \
+            -exec cp {} out/ \; 2>/dev/null || true
+          ls -la out/
+          [ -n "$(ls -A out/ 2>/dev/null)" ] || { echo "未找到 ipk 产物！查看 /tmp/node-build.log"; exit 1; }
+
+      - name: 上传 ipk
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-ipk-arm_cortex-a7_neon-vfpv4
+          path: out/
+
+      - name: 编译日志（失败时排查用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-build-log
+          path: /tmp/node-build.log
