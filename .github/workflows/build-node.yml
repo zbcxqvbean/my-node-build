@@ -58,8 +58,10 @@ jobs:
           fi
           echo "== lede HEAD =="
           git log -1 --format="%H  %cd  %s"
-          echo "== 内核版本 =="
-          grep -E "^LINUX_KERNEL_VERSION|^LINUX_VERSION" include/kernel-version.mk
+          echo "== 目标板内核版本 =="
+          grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
+          echo "== 架构 =="
+          grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
 
       # ═══════════════════════════════════════════════════════════
       # 3. 缓存 dl（只缓存源码 tarball）
@@ -143,7 +145,7 @@ jobs:
           echo "===== nxhack 分支与提交 ====="
           git -C feeds/node log -1 --format="%H %cd %s" 2>/dev/null || echo "(feeds 目录非 git)"
           echo "===== node Makefile 版本 ====="
-          grep -E "PKG_VERSION" package/feeds/node/node/Makefile
+          grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
 
       # ═══════════════════════════════════════════════════════════
       # 7. 选定 node 24.22.1 并 defconfig（只做一次，之后绝不改 .config）
@@ -162,13 +164,13 @@ jobs:
           make defconfig
 
           echo "════════ 最终配置核对 ════════"
-          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config
-          grep -E "^CONFIG_NODEJS_" .config
-          grep -E "^CONFIG_PACKAGE_node" .config
+          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
+          grep -E "^CONFIG_NODEJS_" .config || echo "⚠ 无 NODEJS_ 项"
+          grep -E "^CONFIG_PACKAGE_node" .config || echo "⚠ node 未选中"
 
           echo "════════ Makefile 实际版本 ════════"
-          awk '/CONFIG_NODEJS_24/,/NODE_MODULE_VERSION/' package/feeds/node/node/Makefile | grep PKG_VERSION
-          echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)"
+          awk '/CONFIG_NODEJS_24/,/NODE_MODULE_VERSION/' package/feeds/node/node/Makefile | grep PKG_VERSION || true
+          echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2 || echo '未知')"
 
       # ═══════════════════════════════════════════════════════════
       # 8. 下载源码包（node tarball 约 90MB）
@@ -205,12 +207,14 @@ jobs:
         run: |
           ulimit -n 4096
           echo "开始编译内核: $(date -u +%H:%M:%S)"
-          make target/linux/compile -j4 V=s 2>&1 | tail -50
+          set -o pipefail
+          make target/linux/compile -j4 V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
           echo "内核编译结束: $(date -u +%H:%M:%S)"
-          echo "== 确认 vmlinux 与 modules.builtin 存在 =="
-          ls -lh build_dir/target-*/linux-ipq40xx_generic/linux-*/vmlinux 2>/dev/null || true
-          ls -lh build_dir/target-*/linux-ipq40xx_generic/linux-*/modules.builtin 2>/dev/null || echo "⚠ modules.builtin 不存在"
-          ls -lh build_dir/target-*/linux-ipq40xx_generic/linux-*/drivers/net/ppp/pppox.ko 2>/dev/null || echo "⚠ pppox.ko 不存在"
+          echo "== 产物核验 =="
+          for f in vmlinux modules.builtin drivers/net/ppp/pppox.ko; do
+            p=$(ls build_dir/target-*/linux-ipq40xx_generic/linux-*/$f 2>/dev/null | head -1)
+            if [ -n "$p" ]; then echo "✓ $f"; else echo "✗ $f 缺失"; fi
+          done
 
       # ═══════════════════════════════════════════════════════════
       # 11. 预编译 host 依赖
