@@ -239,21 +239,51 @@ jobs:
 
       # ═══════════════════════════════════════════════════════════
       # 13. 收集产物
+      #
+      #     node 本体 + npm（nxhack Makefile 末尾仅定义这两个包）：
+      #       node137_24.22.1-1_*.ipk   bin/packages/<arch>/node/
+      #       node-npm_24.22.1-1_*.ipk  同上
+      #
+      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 本次构建日志
+      #     Packaged contents 实际输出，二者共同确定，非猜测）：
+      #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
+      #                 +libcares +libatomic
+      #       对应 ipk：libstdcpp6 / libopenssl3(+conf+legacy) /
+      #                 zlib / libnghttp2-14 / libcares / libatomic1
+      #       另含 libc / libgcc1（musl 运行库，已在日志中证实生成）
       # ═══════════════════════════════════════════════════════════
-      - name: 收集产物
+      - name: 收集产物（node + npm + 全部运行时依赖）
         working-directory: lede
         run: |
           mkdir -p out
-          for pat in "node_24*" "node-npm*" "libuv*" "libnghttp2*" "libcares*" "libatomic*"; do
-            find bin/packages -name "${pat}.ipk" -exec cp -v {} out/ \; 2>/dev/null || true
+
+          # node 本体 + npm（精确路径，Makefile 仅此两个包）
+          PKGDIR=bin/packages/arm_cortex-a7_neon-vfpv4/node
+          ls -lh "$PKGDIR"
+          cp -v "$PKGDIR"/node137_24.22.1-1_*.ipk out/
+          cp -v "$PKGDIR"/node-npm_24.22.1-1_*.ipk out/
+
+          # 运行时依赖（包名来自 DEPENDS + 日志实证；版本号留通配，
+          # 因 lede 各次构建小版本可能递增）
+          for pat in "libstdcpp6_*" "libatomic1_*" "libgcc1_*" "libc_*" \
+                     "zlib_*" "libopenssl3_*" "libopenssl-conf_*" \
+                     "libopenssl-legacy_*" "libnghttp2-14_*" "libcares_*"; do
+            find bin/packages bin/targets -name "${pat}.ipk" \
+              -exec cp -v {} out/ \; 2>/dev/null || true
           done
+
           echo "════════ out/ ════════"
           ls -lh out/
-          if [ -z "$(ls -A out/ 2>/dev/null)" ]; then
-            echo "❌ 未产出 ipk"
-            find bin/packages -name "*node*" | head -20
-            exit 1
-          fi
+
+          # 硬校验：node 本体和 npm 必须在
+          ls out/node137_*.ipk > /dev/null 2>&1 || { echo "❌ 缺 node137"; exit 1; }
+          ls out/node-npm_*.ipk > /dev/null 2>&1 || { echo "❌ 缺 node-npm"; exit 1; }
+          # 硬校验：DEPENDS 清单里的每个依赖包都必须收集到
+          for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
+            ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
+          done
+          echo "✅ node + npm + 全部依赖收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
+          sha256sum out/*.ipk
 
       - name: 上传 ipk
         if: success()
