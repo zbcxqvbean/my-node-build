@@ -78,19 +78,21 @@ jobs:
           echo "== feeds 安装完成 =="
           ls -d feeds/packages/lang/node && echo "lede 自带 node 存在"
 
-      # —— 可选：用 nxhack 的 node 覆盖 lede 自带的 ——
-      - name: 切换到 nxhack node feed
+      # —— 用 nxhack 的 node 包覆盖 lede 自带的（直接替换目录，不走 feed 机制，避免包名冲突）——
+      - name: 切换到 nxhack node 包
         if: github.event.inputs.node_source == 'nxhack'
         working-directory: lede
         run: |
-          # 移除 lede 自带的 node 包，避免同名冲突
+          git clone --depth 1 https://github.com/nxhack/openwrt-node-packages.git /tmp/nxp
+          echo "== nxhack 仓库内容 =="
+          ls /tmp/nxp
+          # 删除 lede 自带 node，替换为 nxhack 版本
           rm -rf feeds/packages/lang/node
-          rm -f feeds/packages/lang/node 2>/dev/null || true
-          git clone --depth 1 https://github.com/nxhack/openwrt-node-packages.git feeds/node
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          echo "== nxhack node 版本 =="
-          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/node/node/Makefile | head -5
+          cp -r /tmp/nxp/node feeds/packages/lang/node
+          echo "== 替换后 node 版本 =="
+          grep -E "PKG_VERSION=|PKG_SOURCE_VERSION" feeds/packages/lang/node/Makefile | head -5
+          echo "== 包路径确认 =="
+          ls feeds/packages/lang/node/Makefile
 
       - name: 生成最终 .config（defconfig）
         working-directory: lede
@@ -105,16 +107,12 @@ jobs:
           grep -E "CONFIG_TARGET_BOARD|CONFIG_TARGET_PROFILE|CONFIG_TARGET_ARCH_PACKAGES" .config
           grep -E "^CONFIG_PACKAGE_node" .config || echo "警告：node 未选中"
           echo "== node 目录 =="
-          ls -d feeds/node/node 2>/dev/null || ls -d feeds/packages/lang/node 2>/dev/null
+          ls -d feeds/packages/lang/node
 
       - name: 下载 node 源码包（单独一步，失败可重试）
         working-directory: lede
         run: |
-          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
-            make package/feeds/node/node/download V=s || true
-          else
-            make package/feeds/packages/node/download V=s || true
-          fi
+          make package/feeds/packages/node/download V=s || true
           ls -lh dl/ | grep -i node || echo "dl 中未见 node 包"
 
       - name: 编译工具链
@@ -126,20 +124,13 @@ jobs:
       - name: 预编译 host 依赖（python3 等）
         working-directory: lede
         run: |
-          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
-            make package/feeds/node/node/host/compile -j4 V=s || true
-          fi
           make package/feeds/packages/python3/host/compile -j4 V=s || true
 
       - name: 编译 node ipk
         working-directory: lede
         run: |
           set -o pipefail
-          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
-            TARGET=package/feeds/node/node
-          else
-            TARGET=package/feeds/packages/node
-          fi
+          TARGET=package/feeds/packages/node
           echo "编译目标: $TARGET"
           make $TARGET/compile -j4 V=s 2>&1 | tee /tmp/node-build.log
 
