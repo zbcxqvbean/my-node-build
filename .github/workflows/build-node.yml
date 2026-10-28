@@ -1,17 +1,25 @@
-name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+name: Build node ipk (ipq40xx / ASUS RT-AC42U / armv7)
 
 on:
-  workflow_dispatch:      # 手动触发
+  workflow_dispatch:
     inputs:
       lede_ref:
         description: "lede 分支或 commit（留空 = master）"
         required: false
         default: "master"
+      node_source:
+        description: "node 来源：lede（coolsnowwolf 自带）或 nxhack"
+        required: true
+        default: "nxhack"
+        type: choice
+        options:
+          - nxhack
+          - lede
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 330
 
     steps:
       - name: 安装编译依赖
@@ -19,112 +27,144 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gettext git libncurses-dev libz-dev swig python3 \
-            python3-setuptools rsync unzip time wget curl xxd file
+            python3-setuptools rsync unzip time wget curl xxd file \
+            libssl-dev zlib1g-dev
 
       - name: 拉取 coolsnowwolf/lede 源码
         run: |
-          git clone --depth 1 \
-            https://github.com/coolsnowwolf/lede.git lede
+          git clone https://github.com/coolsnowwolf/lede.git lede
           cd lede
-          # 如果指定了具体 ref，checkout 锁定版本
           if [ -n "${{ github.event.inputs.lede_ref }}" ] \
              && [ "${{ github.event.inputs.lede_ref }}" != "master" ]; then
-            git fetch --depth 1 origin ${{ github.event.inputs.lede_ref }}
-            git checkout ${{ github.event.inputs.lede_ref }}
+            git checkout "${{ github.event.inputs.lede_ref }}"
           fi
           echo "== lede HEAD ==" && git log -1 --format="%H %cd"
 
-      # —— 缓存：dl 下载 + toolchain 编译产物。首次约 1~1.5h，之后 30 分钟内完成 ——
-      - name: 缓存 dl
+      # —— 缓存：只缓存 dl（源码 tarball），不缓存 staging_dir / toolchain ——
+      # 因为 staging_dir 内含 runner 绝对路径，跨 run 复用会导致 host 包“看起来存在但不可用”
+      - name: 缓存 dl（源码包）
         uses: actions/cache@v4
         with:
           path: lede/dl
-          key: lede-dl-ipq40xx-${{ hashFiles('lede/include/kernel-version.mk') }}
-          restore-keys: lede-dl-ipq40xx-
+          key: lede-dl-${{ hashFiles('lede/include/kernel-version.mk') }}-v2
+          restore-keys: |
+            lede-dl-
 
-      - name: 缓存 toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            lede/staging_dir
-            lede/toolchain
-          key: lede-tc-ipq40xx-${{ hashFiles('lede/include/kernel-version.mk') }}-${{ github.event.inputs.lede_ref }}
-          restore-keys: lede-tc-ipq40xx-
-
-      # —— 按你的 .config 精确还原目标：ipq40xx generic + ASUS RT-AC42U + node ——
-      - name: 生成 .config（你的目标配置）
+      # —— 生成 .config：写完就定稿，后面不再改动 ——
+      - name: 生成并定稿 .config
         working-directory: lede
         run: |
+          grep -E 'IPQ40XX|ipq40xx' target/linux/ipq40xx/Makefile || true
           cat > .config <<'EOF'
-          # === 目标：ipq40xx / ASUS RT-AC42U ===
           CONFIG_TARGET_ipq40xx=y
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
 
-          # === feeds（lede 自带 packages 里含 lang/node）===
           CONFIG_FEED_packages=y
           CONFIG_FEED_luci=y
           CONFIG_FEED_routing=y
           CONFIG_FEED_telephony=y
 
-          # === 只编 node 的 ipk，不编整机镜像 ===
           CONFIG_PACKAGE_node=y
+          CONFIG_PACKAGE_node-npm=y
           EOF
+          echo "== 原始 .config 已写入 =="
 
       - name: 更新并安装 feeds
         working-directory: lede
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          # 确保 node 处于选中状态（defconfig 前强制写入）
-          echo "CONFIG_PACKAGE_node=y" >> .config
+          echo "== feeds 安装完成 =="
+          ls -d feeds/packages/lang/node && echo "lede 自带 node 存在"
+
+      # —— 可选：用 nxhack 的 node 覆盖 lede 自带的 ——
+      - name: 切换到 nxhack node feed
+        if: github.event.inputs.node_source == 'nxhack'
+        working-directory: lede
+        run: |
+          # 移除 lede 自带的 node 包，避免同名冲突
+          rm -rf feeds/packages/lang/node
+          rm -f feeds/packages/lang/node 2>/dev/null || true
+          git clone --depth 1 https://github.com/nxhack/openwrt-node-packages.git feeds/node
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "== nxhack node 版本 =="
+          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/node/node/Makefile | head -5
+
+      - name: 生成最终 .config（defconfig）
+        working-directory: lede
+        run: |
+          # 关键：先写 CONFIG 再 defconfig，之后绝不再追加
+          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
+            echo "CONFIG_PACKAGE_node=y" >> .config
+            echo "CONFIG_PACKAGE_node-npm=y" >> .config
+          fi
           make defconfig
-          # defconfig 后二次确认，如被依赖检查掉则再补一次
-          grep -q "^CONFIG_PACKAGE_node=y" .config || echo "CONFIG_PACKAGE_node=y" >> .config
-          echo "== node 包目录 =="
-          ls -d feeds/packages/lang/node 2>/dev/null || { echo "找不到 feeds/packages/lang/node！"; exit 1; }
-
-      - name: 确认配置与 node 版本
-        working-directory: lede
-        run: |
-          echo "== 目标确认 =="
+          echo "== 最终配置 =="
           grep -E "CONFIG_TARGET_BOARD|CONFIG_TARGET_PROFILE|CONFIG_TARGET_ARCH_PACKAGES" .config
-          echo "== node 版本 =="
-          grep -E "PKG_VERSION|PKG_SOURCE_VERSION" feeds/packages/lang/node/Makefile | head -5
-          echo "== node 已选中 =="
-          grep -E "^CONFIG_PACKAGE_node=" .config || echo "警告：.config 中无 CONFIG_PACKAGE_node=y（编译步骤会显式指定目标，不致命）"
+          grep -E "^CONFIG_PACKAGE_node" .config || echo "警告：node 未选中"
+          echo "== node 目录 =="
+          ls -d feeds/node/node 2>/dev/null || ls -d feeds/packages/lang/node 2>/dev/null
 
-      - name: 编译工具链（首次约 1~1.5 小时，之后走缓存）
+      - name: 下载 node 源码包（单独一步，失败可重试）
         working-directory: lede
         run: |
-          make tools/install -j$(nproc) V=s
-          make toolchain/install -j$(nproc) V=s
+          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
+            make package/feeds/node/node/download V=s || true
+          else
+            make package/feeds/packages/node/download V=s || true
+          fi
+          ls -lh dl/ | grep -i node || echo "dl 中未见 node 包"
 
-      - name: 编译 node v24 ipk（4核16G，V8 无压力）
+      - name: 编译工具链
         working-directory: lede
         run: |
-          make package/feeds/packages/node/compile -j$(nproc) V=s \
-            2>&1 | tee /tmp/node-build.log
+          make tools/install -j4 V=s
+          make toolchain/install -j4 V=s
+
+      - name: 预编译 host 依赖（python3 等）
+        working-directory: lede
+        run: |
+          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
+            make package/feeds/node/node/host/compile -j4 V=s || true
+          fi
+          make package/feeds/packages/python3/host/compile -j4 V=s || true
+
+      - name: 编译 node ipk
+        working-directory: lede
+        run: |
+          set -o pipefail
+          if [ "${{ github.event.inputs.node_source }}" = "nxhack" ]; then
+            TARGET=package/feeds/node/node
+          else
+            TARGET=package/feeds/packages/node
+          fi
+          echo "编译目标: $TARGET"
+          make $TARGET/compile -j4 V=s 2>&1 | tee /tmp/node-build.log
 
       - name: 收集产物
         working-directory: lede
         run: |
           mkdir -p out
           find bin/packages bin/targets \
-            \( -name "node_*.ipk" -o -name "node-*.ipk" -o -name "libnode*.ipk" \) \
+            \( -name "node_*.ipk" -o -name "node-*.ipk" -o -name "libnode*.ipk" \
+               -o -name "node-npm*.ipk" \) \
             -exec cp {} out/ \; 2>/dev/null || true
           ls -la out/
-          [ -n "$(ls -A out/ 2>/dev/null)" ] || { echo "未找到 ipk 产物！查看 /tmp/node-build.log"; exit 1; }
+          [ -n "$(ls -A out/ 2>/dev/null)" ] || { echo "未找到 ipk 产物"; exit 1; }
 
       - name: 上传 ipk
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: node-ipk-arm_cortex-a7_neon-vfpv4
           path: out/
 
-      - name: 编译日志（失败时排查用）
-        if: failure()
+      - name: 上传编译日志（无论成败）
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: node-build-log
           path: /tmp/node-build.log
+          if-no-files-found: warn
