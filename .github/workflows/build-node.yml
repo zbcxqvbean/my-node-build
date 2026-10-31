@@ -1,4 +1,4 @@
-name: Build node v24.22.1 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
 
 on:
   workflow_dispatch:
@@ -148,9 +148,9 @@ jobs:
           grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
 
       # ═══════════════════════════════════════════════════════════
-      # 7. 选定 node 24.22.1 并 defconfig（只做一次，之后绝不改 .config）
+      # 7. 选定 node 24.x 并 defconfig（只做一次，之后绝不改 .config）
       # ═══════════════════════════════════════════════════════════
-      - name: 选择 node 24.22.1
+      - name: 选择 node 24.x
         working-directory: lede
         run: |
           cat >> .config <<'EOF'
@@ -228,7 +228,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════
       # 12. 编译 node ipk
       # ═══════════════════════════════════════════════════════════
-      - name: 编译 node 24.22.1 ipk
+      - name: 编译 node 24.x ipk
         working-directory: lede
         run: |
           set -o pipefail
@@ -241,30 +241,42 @@ jobs:
       # 13. 收集产物
       #
       #     node 本体 + npm（nxhack Makefile 末尾仅定义这两个包）：
-      #       node137_24.22.1-1_*.ipk   bin/packages/<arch>/node/
-      #       node-npm_24.22.1-1_*.ipk  同上
+      #       node137_<ver>-1_*.ipk    ← 版本号随 nxhack 更新，不可写死
+      #       node-npm_<ver>-1_*.ipk
+      #     所在目录：bin/packages/<arch>/node/
       #
-      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 本次构建日志
-      #     Packaged contents 实际输出，二者共同确定，非猜测）：
+      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
       #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
       #                 +libcares +libatomic
-      #       对应 ipk：libstdcpp6 / libopenssl3(+conf+legacy) /
-      #                 zlib / libnghttp2-14 / libcares / libatomic1
-      #       另含 libc / libgcc1（musl 运行库，已在日志中证实生成）
       # ═══════════════════════════════════════════════════════════
       - name: 收集产物（node + npm + 全部运行时依赖）
         working-directory: lede
         run: |
           mkdir -p out
 
-          # node 本体 + npm（精确路径，Makefile 仅此两个包）
+          # node 本体 + npm：版本号用通配，不写死（nxhack 升级过 24.22.1→24.22.2）
           PKGDIR=bin/packages/arm_cortex-a7_neon-vfpv4/node
-          ls -lh "$PKGDIR"
-          cp -v "$PKGDIR"/node137_24.22.1-1_*.ipk out/
-          cp -v "$PKGDIR"/node-npm_24.22.1-1_*.ipk out/
+          echo "════════ $PKGDIR 内容 ════════"
+          ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
 
-          # 运行时依赖（包名来自 DEPENDS + 日志实证；版本号留通配，
-          # 因 lede 各次构建小版本可能递增）
+          shopt -s nullglob
+          NODE_IPKS=("$PKGDIR"/node137_*.ipk)
+          NPM_IPKS=("$PKGDIR"/node-npm_*.ipk)
+          shopt -u nullglob
+
+          if [ ${#NODE_IPKS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node137_*.ipk"
+            exit 1
+          fi
+          if [ ${#NPM_IPKS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node-npm_*.ipk"
+            exit 1
+          fi
+          cp -v "${NODE_IPKS[@]}" out/
+          cp -v "${NPM_IPKS[@]}" out/
+
+          # 运行时依赖（包名来自 DEPENDS；版本号通配）
+          # libc_ 写死下划线，避免误匹配 libcares_ 等
           for pat in "libstdcpp6_*" "libatomic1_*" "libgcc1_*" "libc_*" \
                      "zlib_*" "libopenssl3_*" "libopenssl-conf_*" \
                      "libopenssl-legacy_*" "libnghttp2-14_*" "libcares_*"; do
@@ -275,21 +287,22 @@ jobs:
           echo "════════ out/ ════════"
           ls -lh out/
 
-          # 硬校验：node 本体和 npm 必须在
-          ls out/node137_*.ipk > /dev/null 2>&1 || { echo "❌ 缺 node137"; exit 1; }
-          ls out/node-npm_*.ipk > /dev/null 2>&1 || { echo "❌ 缺 node-npm"; exit 1; }
           # 硬校验：DEPENDS 清单里的每个依赖包都必须收集到
           for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
             ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
           done
-          echo "✅ node + npm + 全部依赖收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
+          echo "✅ 收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
+          echo "node 版本: $(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')"
           sha256sum out/*.ipk
+
+          # 把实际版本号写进环境，供上传步骤命名 artifact
+          echo "NODE_VER=$(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')" >> "$GITHUB_ENV"
 
       - name: 上传 ipk
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: node-24.22.1-arm_cortex-a7_neon-vfpv4
+          name: node-${{ env.NODE_VER }}-arm_cortex-a7_neon-vfpv4
           path: lede/out/
           retention-days: 30
 
