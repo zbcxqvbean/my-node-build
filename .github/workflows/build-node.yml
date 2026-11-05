@@ -190,11 +190,15 @@ jobs:
       - name: 编译工具链
         working-directory: lede
         run: |
+          # GitHub runner 的 CMake 是 4.x，会拒绝 cmake_minimum_required < 3.5 的老项目
+          # （本次失败点：tools/dwarves）。设此变量让 CMake 4 兼容 3.5 策略。
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
           ulimit -n 4096
           echo "════════ 资源检查 ════════"
           free -h
           df -h .
           nproc
+          cmake --version
           echo "════════ tools/install 开始 $(date -u +%H:%M:%S) ════════"
           set -o pipefail
           make tools/install -j2 V=s 2>&1 | tee /tmp/toolchain-build.log
