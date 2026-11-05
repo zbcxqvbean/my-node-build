@@ -1,3 +1,296 @@
+name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lede_ref:
+        description: "lede 分支或 commit（留空 = master）"
+        required: false
+        default: "master"
+      nxhack_branch:
+        description: "nxhack 分支（openwrt-24.10 适配 lede 5.10 内核）"
+        required: true
+        default: "openwrt-24.10"
+        type: choice
+        options:
+          - openwrt-24.10
+          - openwrt-25.12
+          - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ═══════════════════════════════════════════════════════════
+      # 1. 主机依赖（lede 官方清单 + nxhack 额外要求）
+      #    nxhack README 明确要求：gcc-multilib / g++-multilib / libatomic
+      # ═══════════════════════════════════════════════════════════
+      - name: 安装主机依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+            genisoimage git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+            libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz \
+            libnsl-dev ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-pyelftools python3-setuptools qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd xz-utils zlib1g-dev libatomic1
+          echo "gcc: $(gcc --version | head -1)"
+          echo "python3: $(python3 --version)"
+
+      # ═══════════════════════════════════════════════════════════
+      # 2. lede 源码
+      # ═══════════════════════════════════════════════════════════
+      - name: 拉取 coolsnowwolf/lede
+        run: |
+          git clone https://github.com/coolsnowwolf/lede.git lede
+          cd lede
+          if [ -n "${{ github.event.inputs.lede_ref }}" ] && \
+             [ "${{ github.event.inputs.lede_ref }}" != "master" ]; then
+            git checkout "${{ github.event.inputs.lede_ref }}"
+          fi
+          echo "== lede HEAD =="
+          git log -1 --format="%H  %cd  %s"
+          echo "== 目标板内核版本 =="
+          grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
+          echo "== 架构 =="
+          grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
+
+      # ═══════════════════════════════════════════════════════════
+      # 3. 缓存 dl（只缓存源码 tarball）
+      # ═══════════════════════════════════════════════════════════
+      - name: 缓存 dl 源码包
+        uses: actions/cache@v4
+        with:
+          path: lede/dl
+          key: lede-dl-${{ hashFiles('lede/include/kernel-version.mk') }}-v4
+          restore-keys: |
+            lede-dl-
+
+      # ═══════════════════════════════════════════════════════════
+      # 4. 板级配置（只为确定目标架构 arm_cortex-a7_neon-vfpv4）
+      # ═══════════════════════════════════════════════════════════
+      - name: 写入板级配置
+        working-directory: lede
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ipq40xx=y
+          CONFIG_TARGET_ipq40xx_generic=y
+          CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
+
+          CONFIG_FEED_packages=y
+          CONFIG_FEED_luci=y
+          CONFIG_FEED_routing=y
+          CONFIG_FEED_telephony=y
+          CONFIG_FEED_node=y
+          EOF
+          echo "板级配置已写入"
+
+      # ═══════════════════════════════════════════════════════════
+      # 5. 官方 feeds
+      # ═══════════════════════════════════════════════════════════
+      - name: 安装官方 feeds
+        working-directory: lede
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "== lede 自带 node 就位 =="
+          ls -d package/feeds/packages/node
+
+      # ═══════════════════════════════════════════════════════════
+      # 6. 接入 nxhack —— 严格按官方 README 五步
+      #
+      #    ① feeds.conf.default 加 src-git node <url>
+      #    ② ./scripts/feeds update node
+      #    ③ rm package/feeds/packages/node
+      #       rm package/feeds/packages/node-*
+      #    ④ ./scripts/feeds install -a -p node
+      #    ⑤ make defconfig
+      #
+      #    注意：-p 后面是 feed 名（src-git 的第二个字段），不是包名。
+      # ═══════════════════════════════════════════════════════════
+      - name: 接入 nxhack node feed
+        working-directory: lede
+        run: |
+          NXBRANCH="${{ github.event.inputs.nxhack_branch }}"
+          echo "nxhack 分支: $NXBRANCH"
+
+          # ① 登记 feed
+          sed -i '/openwrt-node-packages/d' feeds.conf.default
+          echo "src-git node https://github.com/nxhack/openwrt-node-packages.git;$NXBRANCH" >> feeds.conf.default
+          echo "===== feeds.conf.default ====="
+          cat feeds.conf.default
+
+          # ② 更新该 feed
+          ./scripts/feeds update node
+
+          # ③ 删除 coolsnowwolf 自带 node 与全部 node-* 包
+          rm -rf package/feeds/packages/node
+          rm -rf package/feeds/packages/node-*
+
+          # ④ 从 node feed 安装全部包
+          ./scripts/feeds install -a -p node
+
+          # ⑤ 校验
+          echo "===== 校验 nxhack 落地 ====="
+          test -d package/feeds/node/node || { echo "❌ package/feeds/node/node 不存在"; exit 1; }
+          ls package/feeds/node/ | head -10
+          echo "===== nxhack 分支与提交 ====="
+          git -C feeds/node log -1 --format="%H %cd %s" 2>/dev/null || echo "(feeds 目录非 git)"
+          echo "===== node Makefile 版本 ====="
+          grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
+
+      # ═══════════════════════════════════════════════════════════
+      # 7. 选定 node 24.x 并 defconfig（只做一次，之后绝不改 .config）
+      # ═══════════════════════════════════════════════════════════
+      - name: 选择 node 24.x
+        working-directory: lede
+        run: |
+          cat >> .config <<'EOF'
+          CONFIG_NODEJS_24=y
+          CONFIG_NODEJS_ICU_SMALL=y
+          CONFIG_NODEJS_HOST_BIN=y
+          CONFIG_PACKAGE_node=y
+          CONFIG_PACKAGE_node-npm=y
+          EOF
+
+          make defconfig
+
+          echo "════════ 最终配置核对 ════════"
+          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
+          grep -E "^CONFIG_NODEJS_" .config || echo "⚠ 无 NODEJS_ 项"
+          grep -E "^CONFIG_PACKAGE_node" .config || echo "⚠ node 未选中"
+
+          echo "════════ Makefile 实际版本 ════════"
+          awk '/CONFIG_NODEJS_24/,/NODE_MODULE_VERSION/' package/feeds/node/node/Makefile | grep PKG_VERSION || true
+          echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2 || echo '未知')"
+
+      # ═══════════════════════════════════════════════════════════
+      # 8. 下载源码包（node tarball 约 90MB）
+      # ═══════════════════════════════════════════════════════════
+      - name: 下载 node 源码包
+        working-directory: lede
+        run: |
+          make package/feeds/node/node/download V=s || true
+          echo "== dl 中的 node =="
+          ls -lh dl/ | grep -iE "node-v|nodebin" || echo "⚠ 未见 node 源码包"
+
+      # ═══════════════════════════════════════════════════════════
+      # 9. 编译工具链
+      #    -j2 保守（编 gcc 时单进程内存峰值高，-j4 在 16G runner 上易 OOM）
+      #    日志落盘 /tmp/toolchain-build.log，失败时也能下载
+      # ═══════════════════════════════════════════════════════════
+      - name: 编译工具链
+        working-directory: lede
+        run: |
+          ulimit -n 4096
+          echo "════════ 资源检查 ════════"
+          free -h
+          df -h .
+          nproc
+          echo "════════ tools/install 开始 $(date -u +%H:%M:%S) ════════"
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee /tmp/toolchain-build.log
+          echo "════════ tools/install 完成 $(date -u +%H:%M:%S) ════════"
+          echo "════════ toolchain/install 开始 $(date -u +%H:%M:%S) ════════"
+          make toolchain/install -j2 V=s 2>&1 | tee -a /tmp/toolchain-build.log
+          echo "════════ toolchain/install 完成 $(date -u +%H:%M:%S) ════════"
+          echo "== 磁盘剩余 =="
+          df -h .
+
+      # ═══════════════════════════════════════════════════════════
+      # 10. ⚠ 关键新增：先编译内核
+      #
+      #     上一轮失败的真正原因：make node/compile 会触发全量依赖，
+      #     其中包含 package/kernel/linux，而 kmod-pppox 需要
+      #     linux-5.10.272/drivers/net/ppp/pppox.ko
+      #     → 内核没编 → .ko 不存在 → kmod 打包失败 → Error 2
+      #
+      #     这里先把内核编出来，kmod 才能正常打包。
+      # ═══════════════════════════════════════════════════════════
+      - name: 编译内核（kmod 依赖前置）
+        working-directory: lede
+        run: |
+          ulimit -n 4096
+          echo "开始编译内核: $(date -u +%H:%M:%S)"
+          set -o pipefail
+          make target/linux/compile -j4 V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
+          echo "内核编译结束: $(date -u +%H:%M:%S)"
+          echo "== 产物核验 =="
+          for f in vmlinux modules.builtin drivers/net/ppp/pppox.ko; do
+            p=$(ls build_dir/target-*/linux-ipq40xx_generic/linux-*/$f 2>/dev/null | head -1)
+            if [ -n "$p" ]; then echo "✓ $f"; else echo "✗ $f 缺失"; fi
+          done
+
+      # ═══════════════════════════════════════════════════════════
+      # 11. 预编译 host 依赖
+      # ═══════════════════════════════════════════════════════════
+      - name: 预编译 host 依赖
+        working-directory: lede
+        run: |
+          ulimit -n 4096
+          make package/feeds/packages/python3/host/compile -j4 V=s || true
+
+      # ═══════════════════════════════════════════════════════════
+      # 12. 编译 node ipk
+      # ═══════════════════════════════════════════════════════════
+      - name: 编译 node 24.x ipk
+        working-directory: lede
+        run: |
+          set -o pipefail
+          ulimit -n 4096
+          echo "════════ 开始: $(date -u +%H:%M:%S) ════════"
+          make package/feeds/node/node/compile -j4 V=s 2>&1 | tee /tmp/node-build.log
+          echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
+
+      # ═══════════════════════════════════════════════════════════
+      # 13. 收集产物
+      #
+      #     node 本体 + npm（nxhack Makefile 末尾仅定义这两个包）：
+      #       node137_<ver>-1_*.ipk    ← 版本号随 nxhack 更新，不可写死
+      #       node-npm_<ver>-1_*.ipk
+      #     所在目录：bin/packages/<arch>/node/
+      #
+      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
+      #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
+      #                 +libcares +libatomic
+      # ═══════════════════════════════════════════════════════════
+      - name: 收集产物（node + npm + 全部运行时依赖）
+        working-directory: lede
+        run: |
+          mkdir -p out
+
+          # node 本体 + npm：版本号用通配，不写死（nxhack 升级过 24.22.1→24.22.2）
+          PKGDIR=bin/packages/arm_cortex-a7_neon-vfpv4/node
+          echo "════════ $PKGDIR 内容 ════════"
+          ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
+
+          shopt -s nullglob
+          NODE_IPKS=("$PKGDIR"/node137_*.ipk)
+          NPM_IPKS=("$PKGDIR"/node-npm_*.ipk)
+          shopt -u nullglob
+
+          if [ ${#NODE_IPKS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node137_*.ipk"
+            exit 1
+          fi
+          if [ ${#NPM_IPKS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node-npm_*.ipk"
+            exit 1
+          fi
+          cp -v "${NODE_IPKS[@]}" out/
+          cp -v "${NPM_IPKS[@]}" out/
+
+          # 运行时依赖（包名来自 DEPENDS；版本号通配）
+          # libc_ 写死下划线，避免误匹配 libcares_ 等
+          for pat in "libstdcpp6_*" "libatomic1_*" "libgcc1_*" "libc_*" \
                      "zlib_*" "libopenssl3_*" "libopenssl-conf_*" \
                      "libopenssl-legacy_*" "libnghttp2-14_*" "libcares_*"; do
             find bin/packages bin/targets -name "${pat}.ipk" \
