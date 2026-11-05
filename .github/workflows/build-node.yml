@@ -327,24 +327,28 @@ jobs:
         working-directory: lede/out
         run: |
           python3 <<'PYEOF'
-          import glob, gzip, hashlib, io, os, tarfile
+          import glob, gzip, hashlib, io, os, subprocess, tarfile
 
           def read_control(path):
-              data = open(path, "rb").read()
-              off = 8  # 跳过 '!<arch>\n'
-              while off + 60 <= len(data):
-                  hdr = data[off:off+60]
-                  name = hdr[0:16].decode().strip()
-                  size = int(hdr[48:58].decode().strip())
-                  body = data[off+60:off+60+size]
-                  off += 60 + size + (size % 2)
-                  if "control.tar" in name:
-                      t = tarfile.open(fileobj=io.BytesIO(body))
-                      for m in t.getnames():
-                          if m.rstrip("/").endswith("control"):
-                              return t.extractfile(m).read().decode()
-                      raise RuntimeError("control 文件未找到: " + path)
-              raise RuntimeError("control.tar 段未找到: " + path)
+              # 用 binutils 的 ar 命令读取（手工解析 ar 头在部分 ipk 上会字节错位）
+              members = subprocess.run(
+                  ["ar", "t", path], capture_output=True, text=True,
+                  check=True).stdout.split()
+              ctl = [m for m in members if "control.tar" in m]
+              if not ctl:
+                  # 老式 ipk：整个文件是 gzip tar
+                  t = tarfile.open(path, mode="r:gz")
+                  for m in t.getnames():
+                      if m.rstrip("/").endswith("control"):
+                          return t.extractfile(m).read().decode()
+                  raise RuntimeError("control 未找到: " + path)
+              raw = subprocess.run(["ar", "p", path, ctl[0]],
+                                   capture_output=True, check=True).stdout
+              t = tarfile.open(fileobj=io.BytesIO(raw))
+              for m in t.getnames():
+                  if m.rstrip("/").endswith("control"):
+                      return t.extractfile(m).read().decode()
+              raise RuntimeError("control 文件未找到: " + path)
 
           def parse(ctl):
               fields, desc = {}, []
