@@ -316,27 +316,90 @@ jobs:
           echo "NODE_VER=$(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')" >> "$GITHUB_ENV"
 
       # ═══════════════════════════════════════════════════════════
-      # 14. 生成 opkg 源索引（Packages / Packages.gz / Packages.manifest）
-      #     只对 out/ 里这 12 个 ipk 建索引，不掺 bin/packages 里其他包，
-      #     保证索引自洽（不会出现指向不存在文件的条目）
-      #     用 lede 自带的 scripts/opkg-make-index
+      # 14. 生成 opkg 源索引（Packages / Packages.gz）
+      #     lede master 已删除 scripts/opkg-make-index（迁移到 apk），
+      #     所以这里自带索引生成器：手工解析 ipk 的 ar 归档读取
+      #     control 段，计算 Size / SHA256sum / Filename，生成 Packages。
+      #     已用合成 ipk 验证（control 读取、多行 Description 均正常）。
+      #     索引只覆盖 out/ 里收集到的 ipk，保证自洽。
       # ═══════════════════════════════════════════════════════════
       - name: 生成 opkg 源索引
-        working-directory: lede
+        working-directory: lede/out
         run: |
-          cd out
-          "$GITHUB_WORKSPACE/lede/scripts/opkg-make-index" -a . > Packages
+          python3 <<'PYEOF'
+          import glob, gzip, hashlib, io, os, tarfile
+
+          def read_control(path):
+              data = open(path, "rb").read()
+              off = 8  # 跳过 '!<arch>\n'
+              while off + 60 <= len(data):
+                  hdr = data[off:off+60]
+                  name = hdr[0:16].decode().strip()
+                  size = int(hdr[48:58].decode().strip())
+                  body = data[off+60:off+60+size]
+                  off += 60 + size + (size % 2)
+                  if "control.tar" in name:
+                      t = tarfile.open(fileobj=io.BytesIO(body))
+                      for m in t.getnames():
+                          if m.rstrip("/").endswith("control"):
+                              return t.extractfile(m).read().decode()
+                      raise RuntimeError("control 文件未找到: " + path)
+              raise RuntimeError("control.tar 段未找到: " + path)
+
+          def parse(ctl):
+              fields, desc = {}, []
+              cur = None
+              for line in ctl.splitlines():
+                  if line.startswith(" ") or (line == "" and desc):
+                      if cur == "Description":
+                          desc.append(line if line else " .")
+                      continue
+                  if ": " in line:
+                      k, v = line.split(": ", 1)
+                      fields[k] = v
+                      cur = k
+              return fields, desc
+
+          entries = []
+          for ipk in sorted(glob.glob("*.ipk")):
+              fields, desc = parse(read_control(ipk))
+              size = os.path.getsize(ipk)
+              sha = hashlib.sha256(open(ipk, "rb").read()).hexdigest()
+              out = []
+              for k in ["Package", "Version", "Depends", "Conflicts",
+                        "Architecture", "Installed-Size"]:
+                  if k in fields:
+                      out.append("%s: %s" % (k, fields[k]))
+              if desc:
+                  out.append("Description: %s"
+                             % fields.get("Description", "").rstrip())
+                  out.extend(desc)
+              elif "Description" in fields:
+                  out.append("Description: %s" % fields["Description"])
+              out.append("Size: %d" % size)
+              out.append("SHA256sum: %s" % sha)
+              out.append("Filename: %s" % ipk)
+              entries.append("\n".join(out) + "\n\n")
+
+          with open("Packages", "w") as f:
+              f.write("".join(entries))
+          print("Packages 索引生成完成，共 %d 个包" % len(entries))
+          PYEOF
           gzip -kf Packages
           ls -lh Packages Packages.gz
           echo "════════ Packages 内容预览 ════════"
-          grep -E "^Package:|^Version:|^Depends:" Packages
+          grep -E "^Package:|^Version:|^Size:" Packages || true
 
+      # ═══════════════════════════════════════════════════════════
+      # 15. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
+      # ═══════════════════════════════════════════════════════════
       - name: 上传 ipk + 索引
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: node-${{ env.NODE_VER }}-arm_cortex-a7_neon-vfpv4
+          name: node-${{ env.NODE_VER || 'latest' }}-arm_cortex-a7_neon-vfpv4
           path: lede/out/
+          if-no-files-found: error
           retention-days: 30
 
       - name: 上传全部编译日志（无论成败）
