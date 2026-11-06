@@ -209,6 +209,9 @@ jobs:
           CONFIG_NODEJS_HOST_BIN=y
           CONFIG_PACKAGE_node=y
           CONFIG_PACKAGE_node-npm=y
+          # 显式钉死 openssl legacy provider（node 不直接依赖它，老版本 lede
+          # 会顺带编出来，新版本不会 —— 不钉死 artifact 就会少一个文件）
+          CONFIG_PACKAGE_libopenssl-legacy=y
           EOF
 
           make defconfig
@@ -355,7 +358,8 @@ jobs:
           ls -lh out/
 
           # 硬校验：DEPENDS 清单里的每个依赖包都必须收集到
-          for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
+          for need in libstdcpp6 libatomic1 zlib libopenssl3 libopenssl-conf \
+                      libopenssl-legacy libnghttp2-14 libcares; do
             ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
           done
           echo "✅ 收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
