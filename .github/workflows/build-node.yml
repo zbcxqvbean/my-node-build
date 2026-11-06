@@ -25,6 +25,33 @@ on:
           - ubuntu-24.04
           - ubuntu-26.04
           - ubuntu-latest
+      threads:
+        description: "编译线程数（工具链用 -j2 稳，node 阶段可开大）"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "2"
+          - "3"
+          - "4"
+      gen_index:
+        description: "是否生成 opkg 源索引（Packages/Packages.gz）"
+        required: true
+        default: true
+        type: boolean
+      make_release:
+        description: "编译成功后是否发布到 Releases"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write   # make_release 需要：创建 release 和上传产物
+
+# 同一工作流：新触发时自动取消还在跑的旧 run（省 4 小时白跑）
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -86,6 +113,16 @@ jobs:
             lede-dl-
 
       # ═══════════════════════════════════════════════════════════
+      # 3.5 ccache（二次编译提速：node 及各依赖包的重编译命中缓存）
+      # ═══════════════════════════════════════════════════════════
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-node-${{ github.event.inputs.lede_ref }}-v1
+          restore-keys: ccache-node-
+
+      # ═══════════════════════════════════════════════════════════
       # 4. 板级配置（只为确定目标架构 arm_cortex-a7_neon-vfpv4）
       # ═══════════════════════════════════════════════════════════
       - name: 写入板级配置
@@ -95,6 +132,8 @@ jobs:
           CONFIG_TARGET_ipq40xx=y
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
+
+          CONFIG_CCACHE=y
 
           CONFIG_FEED_packages=y
           CONFIG_FEED_luci=y
@@ -212,10 +251,10 @@ jobs:
           cmake --version
           echo "════════ tools/install 开始 $(date -u +%H:%M:%S) ════════"
           set -o pipefail
-          make tools/install -j2 V=s 2>&1 | tee /tmp/toolchain-build.log
+          make tools/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/toolchain-build.log
           echo "════════ tools/install 完成 $(date -u +%H:%M:%S) ════════"
           echo "════════ toolchain/install 开始 $(date -u +%H:%M:%S) ════════"
-          make toolchain/install -j2 V=s 2>&1 | tee -a /tmp/toolchain-build.log
+          make toolchain/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee -a /tmp/toolchain-build.log
           echo "════════ toolchain/install 完成 $(date -u +%H:%M:%S) ════════"
           echo "== 磁盘剩余 =="
           df -h .
@@ -236,7 +275,7 @@ jobs:
           ulimit -n 4096
           echo "开始编译内核: $(date -u +%H:%M:%S)"
           set -o pipefail
-          make target/linux/compile -j4 V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
+          make target/linux/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
           echo "内核编译结束: $(date -u +%H:%M:%S)"
           echo "== 产物核验 =="
           for f in vmlinux modules.builtin drivers/net/ppp/pppox.ko; do
@@ -251,7 +290,7 @@ jobs:
         working-directory: lede
         run: |
           ulimit -n 4096
-          make package/feeds/packages/python3/host/compile -j4 V=s || true
+          make package/feeds/packages/python3/host/compile -j${{ github.event.inputs.threads }} V=s || true
 
       # ═══════════════════════════════════════════════════════════
       # 12. 编译 node ipk
@@ -262,7 +301,7 @@ jobs:
           set -o pipefail
           ulimit -n 4096
           echo "════════ 开始: $(date -u +%H:%M:%S) ════════"
-          make package/feeds/node/node/compile -j4 V=s 2>&1 | tee /tmp/node-build.log
+          make package/feeds/node/node/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/node-build.log
           echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
 
       # ═══════════════════════════════════════════════════════════
@@ -328,38 +367,53 @@ jobs:
 
       # ═══════════════════════════════════════════════════════════
       # 14. 生成 opkg 源索引（Packages / Packages.gz）
-      #     lede master 已删除 scripts/opkg-make-index（迁移到 apk），
-      #     所以这里自带索引生成器：手工解析 ipk 的 ar 归档读取
-      #     control 段，计算 Size / SHA256sum / Filename，生成 Packages。
-      #     已用合成 ipk 验证（control 读取、多行 Description 均正常）。
-      #     索引只覆盖 out/ 里收集到的 ipk，保证自洽。
+      #
+      #     两种 ipk 封装都要支持：
+      #       ① 新格式：整个 ipk 是 gzip tar，内含 ./control.tar.gz
+      #          （OpenWrt 24.10 及 lede 新 ipkg-build 的实际产物）
+      #       ② 老格式：ar 归档，内含 control.tar.gz
+      #     先看文件头魔数判断，避免 ar 报错直接中断。
       # ═══════════════════════════════════════════════════════════
       - name: 生成 opkg 源索引
+        if: github.event.inputs.gen_index == 'true'
         working-directory: lede/out
         run: |
           python3 <<'PYEOF'
-          import glob, gzip, hashlib, io, os, subprocess, tarfile
+          import glob, hashlib, io, os, subprocess, tarfile, traceback
+
+          def control_from_tar(fileobj):
+              """从 control.tar.* 里取出 control 文本"""
+              with tarfile.open(fileobj=fileobj, mode="r:*") as t:
+                  for m in t.getnames():
+                      if m.rstrip("/").split("/")[-1] == "control":
+                          return t.extractfile(m).read().decode("utf-8", "replace")
+              raise RuntimeError("control 文件未找到")
 
           def read_control(path):
-              # 用 binutils 的 ar 命令读取（手工解析 ar 头在部分 ipk 上会字节错位）
-              members = subprocess.run(
-                  ["ar", "t", path], capture_output=True, text=True,
-                  check=True).stdout.split()
-              ctl = [m for m in members if "control.tar" in m]
-              if not ctl:
-                  # 老式 ipk：整个文件是 gzip tar
-                  t = tarfile.open(path, mode="r:gz")
-                  for m in t.getnames():
-                      if m.rstrip("/").endswith("control"):
-                          return t.extractfile(m).read().decode()
-                  raise RuntimeError("control 未找到: " + path)
-              raw = subprocess.run(["ar", "p", path, ctl[0]],
-                                   capture_output=True, check=True).stdout
-              t = tarfile.open(fileobj=io.BytesIO(raw))
-              for m in t.getnames():
-                  if m.rstrip("/").endswith("control"):
-                      return t.extractfile(m).read().decode()
-              raise RuntimeError("control 文件未找到: " + path)
+              with open(path, "rb") as f:
+                  magic = f.read(8)
+
+              # ① 新格式：gzip tar（OpenWrt 24.10+）
+              if magic[:2] == b"\x1f\x8b" or magic[:5] == b"\xfd7zXZ":
+                  with tarfile.open(path, "r:*") as t:
+                      for m in t.getnames():
+                          base = m.rstrip("/").split("/")[-1]
+                          if base.startswith("control.tar"):
+                              return control_from_tar(io.BytesIO(t.extractfile(m).read()))
+                  raise RuntimeError("外层 tar 中无 control.tar")
+
+              # ② 老格式：ar 归档
+              if magic[:7] == b"!<arch>":
+                  members = subprocess.run(["ar", "t", path], capture_output=True,
+                                           text=True, check=True).stdout.split()
+                  ctl = [m for m in members if "control.tar" in m]
+                  if not ctl:
+                      raise RuntimeError("ar 中无 control.tar")
+                  raw = subprocess.run(["ar", "p", path, ctl[0]],
+                                       capture_output=True, check=True).stdout
+                  return control_from_tar(io.BytesIO(raw))
+
+              raise RuntimeError("未知 ipk 封装，文件头=%r" % magic)
 
           def parse(ctl):
               fields, desc = {}, []
@@ -375,30 +429,43 @@ jobs:
                       cur = k
               return fields, desc
 
-          entries = []
+          entries, failed = [], []
           for ipk in sorted(glob.glob("*.ipk")):
-              fields, desc = parse(read_control(ipk))
-              size = os.path.getsize(ipk)
-              sha = hashlib.sha256(open(ipk, "rb").read()).hexdigest()
-              out = []
-              for k in ["Package", "Version", "Depends", "Conflicts",
-                        "Architecture", "Installed-Size"]:
-                  if k in fields:
-                      out.append("%s: %s" % (k, fields[k]))
-              if desc:
-                  out.append("Description: %s"
-                             % fields.get("Description", "").rstrip())
-                  out.extend(desc)
-              elif "Description" in fields:
-                  out.append("Description: %s" % fields["Description"])
-              out.append("Size: %d" % size)
-              out.append("SHA256sum: %s" % sha)
-              out.append("Filename: %s" % ipk)
-              entries.append("\n".join(out) + "\n\n")
+              try:
+                  fields, desc = parse(read_control(ipk))
+                  if "Package" not in fields or "Version" not in fields:
+                      raise RuntimeError("control 缺 Package/Version")
+                  out = []
+                  for k in ["Package", "Version", "Depends", "Provides",
+                            "Conflicts", "Architecture", "Installed-Size"]:
+                      if k in fields:
+                          out.append("%s: %s" % (k, fields[k]))
+                  if desc:
+                      out.append("Description: %s"
+                                 % fields.get("Description", "").rstrip())
+                      out.extend(desc)
+                  elif "Description" in fields:
+                      out.append("Description: %s" % fields["Description"])
+                  out.append("Size: %d" % os.path.getsize(ipk))
+                  out.append("SHA256sum: %s"
+                             % hashlib.sha256(open(ipk, "rb").read()).hexdigest())
+                  out.append("Filename: %s" % ipk)
+                  entries.append("\n".join(out) + "\n\n")
+                  print("✓ %-45s %s" % (ipk, fields["Package"]))
+              except Exception as e:
+                  failed.append(ipk)
+                  print("✗ %s -> %s" % (ipk, e))
+                  traceback.print_exc()
 
           with open("Packages", "w") as f:
               f.write("".join(entries))
-          print("Packages 索引生成完成，共 %d 个包" % len(entries))
+          print("\n完成: %d 个包入索引, %d 个失败" % (len(entries), len(failed)))
+
+          # 只有 node 本体读不出来才算致命；依赖包个别失败不影响
+          if not glob.glob("node137_*.ipk"):
+              raise SystemExit("❌ out/ 中没有 node137_*.ipk")
+          if failed:
+              raise SystemExit("❌ 以下 ipk 无法解析: %s" % " ".join(failed))
           PYEOF
           gzip -kf Packages
           ls -lh Packages Packages.gz
@@ -406,7 +473,24 @@ jobs:
           grep -E "^Package:|^Version:|^Size:" Packages || true
 
       # ═══════════════════════════════════════════════════════════
-      # 15. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
+      # 15. 发布到 Releases（可选，由 make_release 开关控制）
+      # ═══════════════════════════════════════════════════════════
+      - name: 发布到 Releases
+        if: github.event.inputs.make_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: node-v${{ env.NODE_VER || 'latest' }}
+          name: node ${{ env.NODE_VER || 'latest' }} (arm_cortex-a7_neon-vfpv4)
+          body: |
+            nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17（ipq40xx，arm_cortex-a7_neon-vfpv4）
+
+            安装：opkg install node137_*.ipk node-npm_*.ipk
+            （依赖包已随附，如本地 opkg 源已同步索引可直接 opkg update && opkg install node137）
+          files: |
+            lede/out/*
+
+      # ═══════════════════════════════════════════════════════════
+      # 16. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
       # ═══════════════════════════════════════════════════════════
       - name: 上传 ipk + 索引
         if: always()
