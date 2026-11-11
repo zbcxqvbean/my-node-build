@@ -1,518 +1,257 @@
-name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+# ============================================================
+# Honk 配置模板（AI 分组 + 国内外 DNS 分流）
+# ============================================================
+# 本文件包含策略组、DNS、分流和系统设置，也可拆分到 system.dae。
+# 三个必须确认的地方：
+#   1. 节点：自己加 subscription 或 node，一个都不能少，否则组里没有可选节点
+#   2. global 里的 lan_interface：确认与设备实际使用的 LAN 网卡一致（x86 软路由一般是 br-lan，用 ip a 确认）。
+#   3. group 里的地区正则：改成订阅节点名中实际出现的地区关键字。
+# 注意：Honk 组名只支持英文和数字，不能用中文和 emoji。
+# 分流思路参考 qichiyuhub/rule 的 honk 配置：AI 站点逐个点名、Telegram 补 IP 段，
+# 订阅直连拉取，并保留 DoT 与 DNS 分流规则。
+# ============================================================
 
-on:
-  workflow_dispatch:
-    inputs:
-      lede_ref:
-        description: "lede 分支或 commit（留空 = master）"
-        required: false
-        default: "master"
-      nxhack_branch:
-        description: "nxhack 分支（openwrt-24.10 适配 lede 5.10 内核）"
-        required: true
-        default: "openwrt-24.10"
-        type: choice
-        options:
-          - openwrt-24.10
-          - openwrt-25.12
-          - master
-      runner_os:
-        description: "runner 系统（24.04 是验证过的，26 未验证）"
-        required: true
-        default: "ubuntu-24.04"
-        type: choice
-        options:
-          - ubuntu-24.04
-          - ubuntu-26.04
-          - ubuntu-latest
-      threads:
-        description: "编译线程数（工具链用 -j2 稳，node 阶段可开大）"
-        required: true
-        default: "2"
-        type: choice
-        options:
-          - "2"
-          - "3"
-          - "4"
-      gen_index:
-        description: "是否生成 opkg 源索引（Packages/Packages.gz）"
-        required: true
-        default: true
-        type: boolean
-      make_release:
-        description: "编译成功后是否发布到 Releases"
-        required: true
-        default: true
-        type: boolean
+# ---------------- 订阅 ----------------
+# 本模板不带订阅，自己按下面的写法加一段；interval 是刷新间隔，route 是下载出口。
+# Honk 自动识别链接列表、Clash YAML 和 sing-box JSON，不支持 SSR。
+subscription {
+    sub1: 'https://delicate-river-bb41.zbcxqvbean.nyc.mn/3e829510-b4b6-4687-afe4-7bfb86717e02/sub' {
+        interval: 86400s
+        route: direct
+    }
+}
 
-permissions:
-  contents: write   # make_release 需要：创建 release 和上传产物
+# 订阅直连下载，Geo 数据使用系统安装的 v2ray-geosite / v2ray-geoip。
+assets {
+    route: direct
+    subscription {
+        ua: 'clash.meta/1.19.30'
+        interval: 86400s
+        cache: true
+    }
+}
 
-# 同一工作流：新触发时自动取消还在跑的旧 run（省 4 小时白跑）
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+# 手写节点示例：
+# node {
+#     my_vps: 'hysteria2://密码@vps.example.com:443/?sni=vps.example.com'
+# }
 
-jobs:
-  build:
-    runs-on: ${{ github.event.inputs.runner_os }}
-    timeout-minutes: 350
+# ---------------- 策略组 ----------------
+# policy 支持 min_moving_avg、min_avg10、min_last_delay、select、fallback、loadbalance、score。
+# 无效名称会回退到 select。
+# Honk 专用的 final 指定组内回退出口；纯 dae 不支持此字段。
+group {
+    Proxy {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+        final: Final
+    }
 
-    steps:
-      # ═══════════════════════════════════════════════════════════
-      # 1. 主机依赖（lede 官方清单 + nxhack 额外要求）
-      #    nxhack README 明确要求：gcc-multilib / g++-multilib / libatomic
-      # ═══════════════════════════════════════════════════════════
-      - name: 安装主机依赖
-        timeout-minutes: 30   # 超过 30 分钟必是卡死，快速失败而非挂 5 小时
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo -E apt-get update -y
-          sudo -E apt-get install -y --no-install-recommends \
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl \
-            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
-            genisoimage git gperf haveged help2man intltool libc6-dev-i386 \
-            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
-            libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz \
-            libnsl-dev ninja-build p7zip p7zip-full patch pkgconf python3 \
-            python3-pyelftools python3-setuptools qemu-utils rsync scons \
-            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
-            vim wget xmlto xxd xz-utils zlib1g-dev libatomic1
-          echo "gcc: $(gcc --version | head -1)"
-          echo "python3: $(python3 --version)"
+    # --- AI ---
+    OpenAI {
+        filter: name(regex: '🇸🇬|SG|sg|新加坡|狮城|Singapore') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Claude {
+        filter: name(regex: '🇹🇼|TW|tw|台湾|台灣|Taiwan') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Gemini {
+        filter: name(regex: '🇸🇬|SG|sg|新加坡|狮城|Singapore') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Muse {
+        filter: name(regex: '🇸🇬|SG|sg|新加坡|狮城|Singapore') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
 
-      # ═══════════════════════════════════════════════════════════
-      # 2. lede 源码
-      # ═══════════════════════════════════════════════════════════
-      - name: 拉取 coolsnowwolf/lede
-        run: |
-          git clone https://github.com/coolsnowwolf/lede.git lede
-          cd lede
-          if [ -n "${{ github.event.inputs.lede_ref }}" ] && \
-             [ "${{ github.event.inputs.lede_ref }}" != "master" ]; then
-            git checkout "${{ github.event.inputs.lede_ref }}"
-          fi
-          echo "== lede HEAD =="
-          git log -1 --format="%H  %cd  %s"
-          echo "== 目标板内核版本 =="
-          grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
-          echo "== 架构 =="
-          grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
+    # --- 常用平台 ---
+    Youtube {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Google {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Github {
+        filter: name(regex: '🇯🇵|JP|jp|日本|日|Japan') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Telegram {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    TikTok {
+        filter: name(regex: '🇺🇸|US|us|美国|美|United States') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Netflix {
+        filter: name(regex: '🇺🇸|US|us|美国|美|United States') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Wallet {
+        filter: name(regex: '🇺🇸|US|us|美国|美|United States') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Steam {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Microsoft {
+        filter: name(regex: '🇯🇵|JP|jp|日本|日|Japan') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    OneDrive {
+        filter: name(regex: '🇯🇵|JP|jp|日本|日|Japan') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
+    Apple {
+        filter: name(regex: '🇭🇰|HK|hk|香港|港|HongKong') && !name(regex: '排除')
+        policy: min_moving_avg
+    }
 
-      # ═══════════════════════════════════════════════════════════
-      # 3. 缓存 dl（只缓存源码 tarball）
-      # ═══════════════════════════════════════════════════════════
-      - name: 缓存 dl 源码包
-        uses: actions/cache@v4
-        with:
-          path: lede/dl
-          key: lede-dl-${{ hashFiles('lede/include/kernel-version.mk') }}-v4
-          restore-keys: |
-            lede-dl-
+    # 兜底组：全部节点参与评分。
+    Final {
+        filter: !name(regex: '官网|剩余|流量|套餐|免费|订阅|到期时间|直连|Expire Date|Traffic|ExpireDate')
+        policy: score
+    }
+}
 
-      # ═══════════════════════════════════════════════════════════
-      # 3.5 ccache（二次编译提速：node 及各依赖包的重编译命中缓存）
-      # ═══════════════════════════════════════════════════════════
-      - name: 恢复 ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-node-${{ github.event.inputs.lede_ref }}-v1
-          restore-keys: ccache-node-
+# ---------------- DNS ----------------
+dns {
+    upstream {
+        # 国内 DNS 绑定 direct 出口
+        default: 'https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com' -> direct
+        # 国外 DNS 绑定代理出口
+        remote: 'https://8.8.8.8/dns-query?tls_server_name=dns.google' -> Proxy
+    }
+    routing {
+        request {
+            # 此模板禁用 AAAA 与 HTTPS/SVCB 查询。
+            qtype(https, svcb) -> reject
+            qtype(aaaa) -> reject
 
-      # ═══════════════════════════════════════════════════════════
-      # 4. 板级配置（只为确定目标架构 arm_cortex-a7_neon-vfpv4）
-      # ═══════════════════════════════════════════════════════════
-      - name: 写入板级配置
-        working-directory: lede
-        run: |
-          cat > .config <<'EOF'
-          CONFIG_TARGET_ipq40xx=y
-          CONFIG_TARGET_ipq40xx_generic=y
-          CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
+            # Google Play 相关域名使用国外 DNS。
+            qname(suffix: googleapis.cn, suffix: xn--ngstr-lra8j.com) -> remote
 
-          CONFIG_CCACHE=y
+            # asis = 查询私有域名 DNS 请求的原始目标；能否解析取决于原 DNS 服务。
+            qname(geosite: private) -> asis
+            # 国内域名走国内 DNS
+            qname(geosite: cn, geosite: microsoft@cn, geosite: apple@cn) -> default
+            # 国外域名走国外 DNS
+            qname(geosite: geolocation-!cn) -> remote
+            fallback: remote
+        }
+        response {
+            # 国外 DNS 返回国内 IP（CDN 有国内节点）时，改用国内 DNS 重查，拿到就近节点
+            upstream(remote) && ip(geoip: cn) -> default
+            fallback: accept
+        }
+    }
+}
 
-          CONFIG_FEED_packages=y
-          CONFIG_FEED_luci=y
-          CONFIG_FEED_routing=y
-          CONFIG_FEED_telephony=y
-          CONFIG_FEED_node=y
-          EOF
-          echo "板级配置已写入"
+# ---------------- 分流 ----------------
+routing {
+    # NetworkManager 流量直连。
+    pname(NetworkManager) -> direct
+    # 组播地址直连。
+    dip(224.0.0.0/3, 'ff00::/8') -> direct
+    # 阻止 DoT 绕过核心解析。
+    dport(853) -> block
+    # 明确覆盖本机网段，避免管理流量被代理；53 由核心处理，853 已封锁。
+    dip(192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 127.0.0.0/8) && !dport(53) -> direct(must)
+    # 路由器有公网地址时，按需补充直连规则：
+    # dip(203.0.113.9, 240e:xxxx::1) && !dport(53) -> direct(must)
+    # 禁用常见 QUIC 端口；需要 HTTP/3 时可删除此规则。
+    l4proto(udp) && dport(443) -> block
 
-      # ═══════════════════════════════════════════════════════════
-      # 5. 官方 feeds
-      # ═══════════════════════════════════════════════════════════
-      - name: 安装官方 feeds
-        working-directory: lede
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          echo "== lede 自带 node 就位 =="
-          ls -d package/feeds/packages/node
+    # --- 广告 ---
+    domain(geosite: category-ads-all) -> block
 
-      # ═══════════════════════════════════════════════════════════
-      # 6. 接入 nxhack —— 严格按官方 README 五步
-      #
-      #    ① feeds.conf.default 加 src-git node <url>
-      #    ② ./scripts/feeds update node
-      #    ③ rm package/feeds/packages/node
-      #       rm package/feeds/packages/node-*
-      #    ④ ./scripts/feeds install -a -p node
-      #    ⑤ make defconfig
-      #
-      #    注意：-p 后面是 feed 名（src-git 的第二个字段），不是包名。
-      # ═══════════════════════════════════════════════════════════
-      - name: 接入 nxhack node feed
-        working-directory: lede
-        run: |
-          NXBRANCH="${{ github.event.inputs.nxhack_branch }}"
-          echo "nxhack 分支: $NXBRANCH"
+    # --- 中国服务和国服游戏 ---
+    domain(geosite: google-cn, geosite: category-games@cn) -> direct
 
-          # ① 登记 feed
-          sed -i '/openwrt-node-packages/d' feeds.conf.default
-          echo "src-git node https://github.com/nxhack/openwrt-node-packages.git;$NXBRANCH" >> feeds.conf.default
-          echo "===== feeds.conf.default ====="
-          cat feeds.conf.default
+    # --- AI ---
+    domain(geosite: openai, suffix: openai.com, suffix: chatgpt.com,
+           suffix: oaistatic.com, suffix: oaiusercontent.com) -> OpenAI
+    # Claude：本仓库 rule/Claude.list 内联，geosite: anthropic 漏 datadog / sift 这类上报域名
+    domain(suffix: anthropic.com, anthropic.team, claude.ai, claude.com, claude.app,
+           claude.dev, claude.new, claude.site, clau.de, claudeacademy.com,
+           claudemcpclient.com, claudemcpcontent.com, claudepages.dev,
+           claudestudio.com, claudeusercontent.com, chatbotclaude.com, ant.dev,
+           antspace.dev, datadoghq.com, datadoghq.eu, sift.com, siftscience.com) -> Claude
+    domain(keyword: anthropic, claude) -> Claude
+    domain(full: servd-anthropic-website.b-cdn.net, anthropic.com.cdn.cloudflare.net,
+           anthropic.auth0.com, anthropic-com.ghost.io,
+           browser-intake-us5-datadoghq.com, o1158394.ingest.us.sentry.io) -> Claude
+    dip('160.79.104.0/23', '153.61.224.0/22', '2607:6bc0::/48') -> Claude
+    # Gemini 和 NotebookLM
+    domain(geosite: google-gemini, suffix: gemini.google.com,
+           suffix: notebooklm.google) -> Gemini
+    # Muse
+    domain(suffix: muse.ai) -> Muse
+    # 其他 AI 服务走 Proxy。
+    domain(geosite: category-ai-!cn) -> Proxy
 
-          # ② 更新该 feed
-          ./scripts/feeds update node
+    # --- 常用平台 ---
+    domain(suffix: googleapis.cn, suffix: xn--ngstr-lra8j.com, suffix: withgoogle.com) -> Google
+    domain(geosite: youtube) -> Youtube
+    domain(geosite: google) -> Google
+    domain(geosite: github) -> Github
+    domain(geosite: onedrive) -> OneDrive
+    domain(geosite: microsoft@cn) -> direct
+    domain(geosite: microsoft) -> Microsoft
+    domain(geosite: apple@cn) -> direct
+    domain(geosite: apple) -> Apple
+    domain(geosite: telegram) -> Telegram
+    # 覆盖直接连接 Telegram IP 的客户端。
+    dip(geoip: telegram) -> Telegram
+    domain(geosite: tiktok) -> TikTok
+    domain(geosite: netflix) -> Netflix
+    domain(geosite: paypal, geosite: binance, geosite: okx, geosite: category-cryptocurrency) -> Wallet
+    domain(geosite: steam@cn) -> direct
+    domain(geosite: steam) -> Steam
 
-          # ③ 删除 coolsnowwolf 自带 node 与全部 node-* 包
-          rm -rf package/feeds/packages/node
-          rm -rf package/feeds/packages/node-*
+    # --- 兜底 ---
+    # 放在域名规则后，避免国外域名解析到国内 CDN 时误走直连。
+    domain(geosite: cn) -> direct
+    dip(geoip: cn) && !dport(53, 853) -> direct(must)
+    domain(geosite: geolocation-!cn) -> Proxy
+    fallback: Final
+}
 
-          # ④ 从 node feed 安装全部包
-          ./scripts/feeds install -a -p node
+global {
+    wan_interface: auto
+    # LAN 接口；OpenWrt x86 通常为 br-lan。
+    lan_interface: br-lan
+    log_level: info
+    dial_mode: domain
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+    # 保存订阅缓存、API 状态和运行数据库。
+    data_dir: '/etc/honk'
+    store_subscribe: true
+    nfqueue_enable: true
+}
 
-          # ⑤ 校验
-          echo "===== 校验 nxhack 落地 ====="
-          test -d package/feeds/node/node || { echo "❌ package/feeds/node/node 不存在"; exit 1; }
-          ls package/feeds/node/ | head -10
-          echo "===== nxhack 分支与提交 ====="
-          git -C feeds/node log -1 --format="%H %cd %s" 2>/dev/null || echo "(feeds 目录非 git)"
-          echo "===== node Makefile 版本 ====="
-          grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
+experimental {
+    # Doona 通过此 API 连接核心。
+    native_api {
+        enabled: true
+        # 监听所有接口；按需用防火墙限制来源。
+        listen: '0.0.0.0:9527'
+        password_auth: true
+        allow_anonymous_loopback: false
+        config_write: true
+        ui: '/usr/share/doona'
+    }
 
-      # ═══════════════════════════════════════════════════════════
-      # 7. 选定 node 24.x 并 defconfig（只做一次，之后绝不改 .config）
-      # ═══════════════════════════════════════════════════════════
-      - name: 选择 node 24.x
-        working-directory: lede
-        run: |
-          cat >> .config <<'EOF'
-          CONFIG_NODEJS_24=y
-          CONFIG_NODEJS_ICU_SMALL=y
-          CONFIG_NODEJS_HOST_BIN=y
-          CONFIG_PACKAGE_node=y
-          CONFIG_PACKAGE_node-npm=y
-          # 显式钉死 openssl legacy provider（node 不直接依赖它，老版本 lede
-          # 会顺带编出来，新版本不会 —— 不钉死 artifact 就会少一个文件）
-          CONFIG_PACKAGE_libopenssl-legacy=y
-          EOF
-
-          make defconfig
-
-          echo "════════ 最终配置核对 ════════"
-          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
-          grep -E "^CONFIG_NODEJS_" .config || echo "⚠ 无 NODEJS_ 项"
-          grep -E "^CONFIG_PACKAGE_node" .config || echo "⚠ node 未选中"
-
-          echo "════════ Makefile 实际版本 ════════"
-          awk '/CONFIG_NODEJS_24/,/NODE_MODULE_VERSION/' package/feeds/node/node/Makefile | grep PKG_VERSION || true
-          echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2 || echo '未知')"
-
-      # ═══════════════════════════════════════════════════════════
-      # 8. 下载源码包（node tarball 约 90MB）
-      # ═══════════════════════════════════════════════════════════
-      - name: 下载 node 源码包
-        working-directory: lede
-        run: |
-          make package/feeds/node/node/download V=s || true
-          echo "== dl 中的 node =="
-          ls -lh dl/ | grep -iE "node-v|nodebin" || echo "⚠ 未见 node 源码包"
-
-      # ═══════════════════════════════════════════════════════════
-      # 9. 编译工具链
-      #    -j2 保守（编 gcc 时单进程内存峰值高，-j4 在 16G runner 上易 OOM）
-      #    日志落盘 /tmp/toolchain-build.log，失败时也能下载
-      # ═══════════════════════════════════════════════════════════
-      - name: 编译工具链
-        working-directory: lede
-        run: |
-          # GitHub runner 的 CMake 是 4.x，会拒绝 cmake_minimum_required < 3.5 的老项目
-          # （本次失败点：tools/dwarves）。设此变量让 CMake 4 兼容 3.5 策略。
-          export CMAKE_POLICY_VERSION_MINIMUM=3.5
-          ulimit -n 4096
-          echo "════════ 资源检查 ════════"
-          free -h
-          df -h .
-          nproc
-          cmake --version
-          echo "════════ tools/install 开始 $(date -u +%H:%M:%S) ════════"
-          set -o pipefail
-          make tools/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/toolchain-build.log
-          echo "════════ tools/install 完成 $(date -u +%H:%M:%S) ════════"
-          echo "════════ toolchain/install 开始 $(date -u +%H:%M:%S) ════════"
-          make toolchain/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee -a /tmp/toolchain-build.log
-          echo "════════ toolchain/install 完成 $(date -u +%H:%M:%S) ════════"
-          echo "== 磁盘剩余 =="
-          df -h .
-
-      # ═══════════════════════════════════════════════════════════
-      # 10. ⚠ 关键新增：先编译内核
-      #
-      #     上一轮失败的真正原因：make node/compile 会触发全量依赖，
-      #     其中包含 package/kernel/linux，而 kmod-pppox 需要
-      #     linux-5.10.272/drivers/net/ppp/pppox.ko
-      #     → 内核没编 → .ko 不存在 → kmod 打包失败 → Error 2
-      #
-      #     这里先把内核编出来，kmod 才能正常打包。
-      # ═══════════════════════════════════════════════════════════
-      - name: 编译内核（kmod 依赖前置）
-        working-directory: lede
-        run: |
-          ulimit -n 4096
-          echo "开始编译内核: $(date -u +%H:%M:%S)"
-          set -o pipefail
-          make target/linux/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
-          echo "内核编译结束: $(date -u +%H:%M:%S)"
-          echo "== 产物核验 =="
-          for f in vmlinux modules.builtin drivers/net/ppp/pppox.ko; do
-            p=$(ls build_dir/target-*/linux-ipq40xx_generic/linux-*/$f 2>/dev/null | head -1)
-            if [ -n "$p" ]; then echo "✓ $f"; else echo "✗ $f 缺失"; fi
-          done
-
-      # ═══════════════════════════════════════════════════════════
-      # 11. 预编译 host 依赖
-      # ═══════════════════════════════════════════════════════════
-      - name: 预编译 host 依赖
-        working-directory: lede
-        run: |
-          ulimit -n 4096
-          make package/feeds/packages/python3/host/compile -j${{ github.event.inputs.threads }} V=s || true
-
-      # ═══════════════════════════════════════════════════════════
-      # 12. 编译 node ipk
-      # ═══════════════════════════════════════════════════════════
-      - name: 编译 node 24.x ipk
-        working-directory: lede
-        run: |
-          set -o pipefail
-          ulimit -n 4096
-          echo "════════ 开始: $(date -u +%H:%M:%S) ════════"
-          make package/feeds/node/node/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/node-build.log
-          echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
-
-      # ═══════════════════════════════════════════════════════════
-      # 13. 收集产物
-      #
-      #     node 本体 + npm（nxhack Makefile 末尾仅定义这两个包）：
-      #       node137_<ver>-1_*.ipk    ← 版本号随 nxhack 更新，不可写死
-      #       node-npm_<ver>-1_*.ipk
-      #     所在目录：bin/packages/<arch>/node/
-      #
-      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
-      #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
-      #                 +libcares +libatomic
-      # ═══════════════════════════════════════════════════════════
-      - name: 收集产物（node + npm + 全部运行时依赖）
-        working-directory: lede
-        run: |
-          mkdir -p out
-
-          # node 本体 + npm：版本号用通配，不写死（nxhack 升级过 24.22.1→24.22.2）
-          PKGDIR=bin/packages/arm_cortex-a7_neon-vfpv4/node
-          echo "════════ $PKGDIR 内容 ════════"
-          ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
-
-          shopt -s nullglob
-          NODE_IPKS=("$PKGDIR"/node137_*.ipk)
-          NPM_IPKS=("$PKGDIR"/node-npm_*.ipk)
-          shopt -u nullglob
-
-          if [ ${#NODE_IPKS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node137_*.ipk"
-            exit 1
-          fi
-          if [ ${#NPM_IPKS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node-npm_*.ipk"
-            exit 1
-          fi
-          cp -v "${NODE_IPKS[@]}" out/
-          cp -v "${NPM_IPKS[@]}" out/
-
-          # 运行时依赖（包名来自 DEPENDS；版本号通配）
-          # libc_ 写死下划线，避免误匹配 libcares_ 等
-          for pat in "libstdcpp6_*" "libatomic1_*" "libgcc1_*" "libc_*" \
-                     "zlib_*" "libopenssl3_*" "libopenssl-conf_*" \
-                     "libopenssl-legacy_*" "libnghttp2-14_*" "libcares_*"; do
-            find bin/packages bin/targets -name "${pat}.ipk" \
-              -exec cp -v {} out/ \; 2>/dev/null || true
-          done
-
-          echo "════════ out/ ════════"
-          ls -lh out/
-
-          # 硬校验：DEPENDS 清单里的每个依赖包都必须收集到
-          for need in libstdcpp6 libatomic1 zlib libopenssl3 libopenssl-conf \
-                      libopenssl-legacy libnghttp2-14 libcares; do
-            ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
-          done
-          echo "✅ 收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
-          echo "node 版本: $(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')"
-          sha256sum out/*.ipk
-
-          # 把实际版本号写进环境，供上传步骤命名 artifact
-          echo "NODE_VER=$(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')" >> "$GITHUB_ENV"
-
-      # ═══════════════════════════════════════════════════════════
-      # 14. 生成 opkg 源索引（Packages / Packages.gz）
-      #
-      #     两种 ipk 封装都要支持：
-      #       ① 新格式：整个 ipk 是 gzip tar，内含 ./control.tar.gz
-      #          （OpenWrt 24.10 及 lede 新 ipkg-build 的实际产物）
-      #       ② 老格式：ar 归档，内含 control.tar.gz
-      #     先看文件头魔数判断，避免 ar 报错直接中断。
-      # ═══════════════════════════════════════════════════════════
-      - name: 生成 opkg 源索引
-        if: github.event.inputs.gen_index == 'true'
-        working-directory: lede/out
-        run: |
-          python3 <<'PYEOF'
-          import glob, hashlib, io, os, subprocess, tarfile, traceback
-
-          def control_from_tar(fileobj):
-              """从 control.tar.* 里取出 control 文本"""
-              with tarfile.open(fileobj=fileobj, mode="r:*") as t:
-                  for m in t.getnames():
-                      if m.rstrip("/").split("/")[-1] == "control":
-                          return t.extractfile(m).read().decode("utf-8", "replace")
-              raise RuntimeError("control 文件未找到")
-
-          def read_control(path):
-              with open(path, "rb") as f:
-                  magic = f.read(8)
-
-              # ① 新格式：gzip tar（OpenWrt 24.10+）
-              if magic[:2] == b"\x1f\x8b" or magic[:5] == b"\xfd7zXZ":
-                  with tarfile.open(path, "r:*") as t:
-                      for m in t.getnames():
-                          base = m.rstrip("/").split("/")[-1]
-                          if base.startswith("control.tar"):
-                              return control_from_tar(io.BytesIO(t.extractfile(m).read()))
-                  raise RuntimeError("外层 tar 中无 control.tar")
-
-              # ② 老格式：ar 归档
-              if magic[:7] == b"!<arch>":
-                  members = subprocess.run(["ar", "t", path], capture_output=True,
-                                           text=True, check=True).stdout.split()
-                  ctl = [m for m in members if "control.tar" in m]
-                  if not ctl:
-                      raise RuntimeError("ar 中无 control.tar")
-                  raw = subprocess.run(["ar", "p", path, ctl[0]],
-                                       capture_output=True, check=True).stdout
-                  return control_from_tar(io.BytesIO(raw))
-
-              raise RuntimeError("未知 ipk 封装，文件头=%r" % magic)
-
-          def parse(ctl):
-              fields, desc = {}, []
-              cur = None
-              for line in ctl.splitlines():
-                  if line.startswith(" ") or (line == "" and desc):
-                      if cur == "Description":
-                          desc.append(line if line else " .")
-                      continue
-                  if ": " in line:
-                      k, v = line.split(": ", 1)
-                      fields[k] = v
-                      cur = k
-              return fields, desc
-
-          entries, failed = [], []
-          for ipk in sorted(glob.glob("*.ipk")):
-              try:
-                  fields, desc = parse(read_control(ipk))
-                  if "Package" not in fields or "Version" not in fields:
-                      raise RuntimeError("control 缺 Package/Version")
-                  out = []
-                  for k in ["Package", "Version", "Depends", "Provides",
-                            "Conflicts", "Architecture", "Installed-Size"]:
-                      if k in fields:
-                          out.append("%s: %s" % (k, fields[k]))
-                  if desc:
-                      out.append("Description: %s"
-                                 % fields.get("Description", "").rstrip())
-                      out.extend(desc)
-                  elif "Description" in fields:
-                      out.append("Description: %s" % fields["Description"])
-                  out.append("Size: %d" % os.path.getsize(ipk))
-                  out.append("SHA256sum: %s"
-                             % hashlib.sha256(open(ipk, "rb").read()).hexdigest())
-                  out.append("Filename: %s" % ipk)
-                  entries.append("\n".join(out) + "\n\n")
-                  print("✓ %-45s %s" % (ipk, fields["Package"]))
-              except Exception as e:
-                  failed.append(ipk)
-                  print("✗ %s -> %s" % (ipk, e))
-                  traceback.print_exc()
-
-          with open("Packages", "w") as f:
-              f.write("".join(entries))
-          print("\n完成: %d 个包入索引, %d 个失败" % (len(entries), len(failed)))
-
-          # 只有 node 本体读不出来才算致命；依赖包个别失败不影响
-          if not glob.glob("node137_*.ipk"):
-              raise SystemExit("❌ out/ 中没有 node137_*.ipk")
-          if failed:
-              raise SystemExit("❌ 以下 ipk 无法解析: %s" % " ".join(failed))
-          PYEOF
-          gzip -kf Packages
-          ls -lh Packages Packages.gz
-          echo "════════ Packages 内容预览 ════════"
-          grep -E "^Package:|^Version:|^Size:" Packages || true
-
-      # ═══════════════════════════════════════════════════════════
-      # 15. 发布到 Releases（可选，由 make_release 开关控制）
-      # ═══════════════════════════════════════════════════════════
-      - name: 发布到 Releases
-        if: github.event.inputs.make_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: node-v${{ env.NODE_VER || 'latest' }}
-          name: node ${{ env.NODE_VER || 'latest' }} (arm_cortex-a7_neon-vfpv4)
-          body: |
-            nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17（ipq40xx，arm_cortex-a7_neon-vfpv4）
-
-            安装：opkg install node137_*.ipk node-npm_*.ipk
-            （依赖包已随附，如本地 opkg 源已同步索引可直接 opkg update && opkg install node137）
-          files: |
-            lede/out/*
-
-      # ═══════════════════════════════════════════════════════════
-      # 16. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
-      # ═══════════════════════════════════════════════════════════
-      - name: 上传 ipk + 索引
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: node-${{ env.NODE_VER || 'latest' }}-arm_cortex-a7_neon-vfpv4
-          path: lede/out/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: 上传全部编译日志（无论成败）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            /tmp/toolchain-build.log
-            /tmp/kernel-build.log
-            /tmp/node-build.log
-          if-no-files-found: warn
-          retention-days: 30
+    # Clash API 面板接口；设置强口令并按需限制来源。
+    clash_api {
+        external_controller: '0.0.0.0:9090'
+        external_ui: '/usr/share/honk/zashboard'
+        secret: '123456'
+        default_mode: Rule
+    }
+}
