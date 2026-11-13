@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: "OpenWrt 源码仓库（immortalwrt 建议用 openwrt-24.10 分支，master 已切 apk）"
+        description: "OpenWrt 源码仓库（两个源默认都走 master）"
         required: true
         default: "coolsnowwolf/lede"
         type: choice
@@ -12,7 +12,7 @@ on:
           - coolsnowwolf/lede
           - immortalwrt/immortalwrt
       source_ref:
-        description: "源码分支/tag（留空 = 默认：lede→master，immortalwrt→openwrt-24.10）"
+        description: "源码分支/tag（留空 = 默认 master；immortalwrt 建议保持 master 与本地固件同源）"
         required: false
         default: ""
       node_major:
@@ -26,7 +26,7 @@ on:
           - "24"
           - "26"
       nxhack_branch:
-        description: "nxhack 分支（需与源码匹配：openwrt-24.10 / openwrt-25.12 / master）"
+        description: "nxhack 分支（与源码匹配：master 源码→master；24.10→openwrt-24.10）"
         required: true
         default: "openwrt-24.10"
         type: choice
@@ -111,10 +111,7 @@ jobs:
           REPO="${{ github.event.inputs.source_repo }}"
           REF="${{ github.event.inputs.source_ref }}"
           if [ -z "$REF" ]; then
-            case "$REPO" in
-              immortalwrt/immortalwrt) REF="openwrt-24.10" ;;   # master 已切 apk，默认给 24.10
-              *)                       REF="master" ;;
-            esac
+            REF="master"   # 两个源都默认 master，与本地固件保持同源
           fi
           echo "repo=$REPO  ref=$REF"
           echo "SOURCE_TAG=$(echo "$REPO" | tr '/' '-')-$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
@@ -129,9 +126,11 @@ jobs:
           grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
           echo "== 架构 =="
           grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
-          echo "== 打包格式 =="
-          if [ -f package/system/apk/Makefile ]; then echo "含 apk 支持"; fi
-          if [ -f package/system/opkg/Makefile ]; then echo "含 opkg 支持"; fi
+          echo "== 打包格式探测 =="
+          if [ -f include/package-ipkg.mk ]; then echo "ipkg 独立实现（老式，固定出 ipk）"; fi
+          if [ -f include/package-pack.mk ]; then echo "package-pack.mk（双格式，由 CONFIG_USE_APK 决定 ipk/apk）"; fi
+          echo -n "USE_APK 默认值: "
+          awk '/^[[:space:]]*config USE_APK/{f=1} f&&/default/{print $2; exit}' config/Config-build.in 2>/dev/null || echo "未找到（老式源码，无双格式）"
 
       # ═══════════════════════════════════════════════════════════
       # 3. 缓存 dl（只缓存源码 tarball）
@@ -160,12 +159,20 @@ jobs:
       - name: 写入板级配置
         working-directory: src
         run: |
+          # 强制出 ipk（opkg），不用 apk。
+          # immortalwrt master 的 config/Config-build.in 里 USE_APK 是 default y，
+          # 但 include/package-pack.mk 是双分支实现：
+          #   CONFIG_USE_APK 为空  → ipkg-build → <pkg>_<ver>_<arch>.ipk
+          #   CONFIG_USE_APK=y    → apk mkpkg  → <pkg>-<ver>.apk
+          # 所以显式关掉就能在 master 上继续出 ipk，装到 opkg 固件上。
           cat > .config <<'EOF'
           CONFIG_TARGET_ipq40xx=y
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
 
           CONFIG_CCACHE=y
+
+          # CONFIG_USE_APK is not set
 
           CONFIG_FEED_packages=y
           CONFIG_FEED_luci=y
@@ -283,12 +290,20 @@ jobs:
             exit 1
           fi
 
-          # ② OpenWrt 25.x 默认 apk，产物是 .apk，本工作流只处理 ipk
+          # ② 必须是 ipk 模式（opkg 固件只能装 ipk）。
+          #    板级配置里已写死 "# CONFIG_USE_APK is not set"，
+          #    这里只做最终校验：如果它被 defconfig 又打开了，说明该源码
+          #    不支持 ipk 打包（或符号名变了），必须当场失败而不是白编几小时。
           if grep -q "^CONFIG_USE_APK=y" .config; then
-            echo "❌ 该源码分支默认使用 apk（OpenWrt 25.x）"
-            echo "   本工作流产出 ipk（opkg），请改用 openwrt-24.10 分支/ref"
+            echo "❌ 仍然是 apk 模式，产物会是 .apk，opkg 固件装不了"
+            echo "---- 当前打包相关配置 ----"
+            grep -E "^CONFIG_USE_APK|^# CONFIG_USE_APK" .config || true
+            echo "---- 源码打包实现 ----"
+            ls -l include/package-ipkg.mk include/package-pack.mk 2>/dev/null || true
+            grep -n "PACK_\$(1):=" include/package-pack.mk 2>/dev/null | head -4 || true
             exit 1
           fi
+          echo "✅ 打包格式: ipk（CONFIG_USE_APK 未启用）"
 
           echo "════════ 最终配置核对 ════════"
           grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
@@ -617,7 +632,7 @@ jobs:
             nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17
             （ipq40xx，arm_cortex-a7_neon-vfpv4）
 
-            - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || '默认分支' }}
+            - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || 'master（默认）' }}
             - node 主版本：${{ github.event.inputs.node_major }}.x（ABI ${{ env.NODE_ABI || '?' }}）
             - nxhack feed：${{ github.event.inputs.nxhack_branch }}
 
