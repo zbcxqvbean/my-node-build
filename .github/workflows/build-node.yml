@@ -1,22 +1,50 @@
-name: Build node ipk (ipq40xx / ASUS RT-AC42U / armv7)
+name: Build node apk/ipk (immortalwrt / ipq40xx / ASUS RT-AC42U)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  目标：在 immortalwrt master（默认 apk / apk-tools 3）上编译 nxhack node，
+#        产物直接可装到 ASUS RT-AC42U(=ACRH17) / ipq40xx / arm_cortex-a7_neon-vfpv4。
+#
+#  打包格式：完全跟随源码自身设定，不写任何 CONFIG_USE_APK。
+#        immortalwrt master（config/Config-build.in: USE_APK default y）→ .apk
+#        coolsnowwolf/lede                                             → .ipk
+#        编译前探测、编译后按实际产物二次确认。
+#
+#  apk 关键事实（来自 immortalwrt 自身源码，不是猜的）：
+#    1) package/system/apk/Makefile: PKG_VERSION=3.0.5 → apk-tools 3
+#    2) package/Makefile: PACKAGE_EXT=apk, 索引文件 = packages.adb
+#    3) 索引生成 = apk mkndx --root .. --keys-dir .. --allow-untrusted -o packages.adb *.apk
+#       （APKINDEX.tar.gz 是 apk-tools 2.x / 24.10 的老格式，apk 3 不认）
+#    4) 包名 = <name><ABI>-<version>.apk，例如 node137-24.22.2-r1.apk
+#    5) SIGN_EACH_PACKAGE 默认 y，单包编译不会自动生成密钥 → 本流程自己补生成
+# ═══════════════════════════════════════════════════════════════════════
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: "OpenWrt 源码仓库（两个源默认都走 master）"
+        description: "源码仓库（immortalwrt=apk，coolsnowwolf=ipk）"
         required: true
-        default: "coolsnowwolf/lede"
+        default: "immortalwrt/immortalwrt"
         type: choice
         options:
-          - coolsnowwolf/lede
           - immortalwrt/immortalwrt
+          - coolsnowwolf/lede
       source_ref:
-        description: "源码分支/tag（留空 = 默认 master；immortalwrt 建议保持 master 与本地固件同源）"
+        description: "分支/tag（留空 = master，与本地固件同源）"
         required: false
         default: ""
+      nxhack_branch:
+        description: "nxhack 分支（auto = 按 source_ref 自动匹配）"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - master
+          - openwrt-25.12
+          - openwrt-24.10
       node_major:
-        description: "node 主版本（20 仅 24.10 分支；26 仅 25.12/master；没有 23）"
+        description: "node 主版本（24.10=20/22/24；25.12/master=22/24/26）"
         required: true
         default: "24"
         type: choice
@@ -25,26 +53,8 @@ on:
           - "22"
           - "24"
           - "26"
-      nxhack_branch:
-        description: "nxhack 分支（与源码匹配：master 源码→master；24.10→openwrt-24.10）"
-        required: true
-        default: "openwrt-24.10"
-        type: choice
-        options:
-          - openwrt-24.10
-          - openwrt-25.12
-          - master
-      runner_os:
-        description: "runner 系统（24.04 是验证过的，26 未验证）"
-        required: true
-        default: "ubuntu-24.04"
-        type: choice
-        options:
-          - ubuntu-24.04
-          - ubuntu-26.04
-          - ubuntu-latest
       threads:
-        description: "编译线程数（工具链用 -j2 稳，node 阶段可开大）"
+        description: "并行度（工具链 2 稳；node 阶段可 4）"
         required: true
         default: "2"
         type: choice
@@ -53,22 +63,30 @@ on:
           - "3"
           - "4"
       gen_index:
-        description: "是否生成源索引（ipk→Packages/Packages.gz，apk→APKINDEX.tar.gz）"
+        description: "生成源索引（apk→packages.adb，ipk→Packages/Packages.gz）"
         required: true
         default: true
         type: boolean
       make_release:
-        description: "编译成功后是否发布到 Releases"
+        description: "编译成功后发布到 Releases"
         required: true
         default: true
         type: boolean
+      runner_os:
+        description: "runner（24.04 已验证）"
+        required: true
+        default: "ubuntu-24.04"
+        type: choice
+        options:
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-latest
 
 permissions:
-  contents: write   # make_release 需要：创建 release 和上传产物
+  contents: write
 
-# 同一工作流：新触发时自动取消还在跑的旧 run（省 4 小时白跑）
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.event.inputs.source_repo }}-${{ github.event.inputs.node_major }}
   cancel-in-progress: true
 
 jobs:
@@ -77,42 +95,32 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # ═══════════════════════════════════════════════════════════
-      # 1. 主机依赖：按所选源码，用它自己的官方清单
-      #
-      #    coolsnowwolf/lede     → lede README 的 apt 清单
-      #    immortalwrt           → immortalwrt install-deps 的 apt 清单
-      #
-      #    两套清单原样保留，只做「Ubuntu 24.04 不存在该包名」的等价替换
-      #    （已在 noble 的 Packages 索引里逐个核对过）：
-      #      gnutls-dev                         不存在 → libgnutls28-dev
-      #      libz-dev                           不存在 → zlib1g-dev（清单本就有）
-      #      mkisofs                            不存在 → genisoimage
-      #      libncurses5-dev / libncursesw5-dev  前者不存在、后者仅虚拟 → libncurses-dev
-      #    另外双方都加 libatomic1（nxhack README 明确要求）。
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 1. 清盘：runner 只有 ~14G 可用，OpenWrt 全量编译 + node 很容易撑爆
+      # ═══════════════════════════════════════════════════════════════
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /opt/az 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+          free -h
+
+      # ═══════════════════════════════════════════════════════════════
+      # 2. 主机依赖：按源用它自己的官方清单
+      #    immortalwrt → immortalwrt 的 install-deps 清单
+      #    lede        → lede README 的清单
+      #    仅做「Ubuntu 24.04 不存在该包名」的等价映射（已在 noble 索引核对）：
+      #      gnutls-dev → libgnutls28-dev、libz-dev → zlib1g-dev、
+      #      mkisofs → genisoimage、libncurses5-dev/libncursesw5-dev → libncurses-dev
+      # ═══════════════════════════════════════════════════════════════
       - name: 安装主机依赖
-        timeout-minutes: 30   # 超过 30 分钟必是卡死，快速失败而非挂 5 小时
+        timeout-minutes: 30
         run: |
           export DEBIAN_FRONTEND=noninteractive
           REPO="${{ github.event.inputs.source_repo }}"
 
-          # coolsnowwolf/lede README 原文清单（libncurses5-dev+libncursesw5-dev → libncurses-dev）
-          LEDE_DEPS=(
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison
-            build-essential bzip2 ccache clang cmake cpio curl
-            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext
-            genisoimage git gperf haveged help2man intltool libc6-dev-i386
-            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev
-            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev
-            libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev
-            ninja-build p7zip p7zip-full patch pkgconf python3
-            python3-pyelftools python3-setuptools qemu-utils rsync scons
-            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip
-            vim wget xmlto xxd xz-utils zlib1g-dev
-          )
-
-          # immortalwrt install-deps 原文清单（gnutls-dev/libz-dev/mkisofs 已映射）
           IMM_DEPS=(
             ack antlr3 asciidoc autoconf automake autopoint binutils bison
             build-essential bzip2 ccache clang cmake cpio curl
@@ -127,86 +135,121 @@ jobs:
             uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
           )
 
+          LEDE_DEPS=(
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison
+            build-essential bzip2 ccache clang cmake cpio curl
+            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext
+            genisoimage git gperf haveged help2man intltool libc6-dev-i386
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev
+            libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev
+            ninja-build p7zip p7zip-full patch pkgconf python3
+            python3-pyelftools python3-setuptools qemu-utils rsync scons
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip
+            vim wget xmlto xxd xz-utils zlib1g-dev
+          )
+
           case "$REPO" in
-            immortalwrt/immortalwrt) DEPS=("${IMM_DEPS[@]}") ; DEPNAME="immortalwrt" ;;
-            *)                        DEPS=("${LEDE_DEPS[@]}") ; DEPNAME="coolsnowwolf/lede" ;;
+            immortalwrt/immortalwrt) DEPS=("${IMM_DEPS[@]}"); DEPNAME="immortalwrt" ;;
+            *)                        DEPS=("${LEDE_DEPS[@]}"); DEPNAME="coolsnowwolf/lede" ;;
           esac
-          DEPS+=(libatomic1)   # nxhack 要求
+          DEPS+=(libatomic1)   # nxhack README 要求
 
-          # 去重（映射后可能重复，如 libncurses-dev / zlib1g-dev）
           mapfile -t DEPS < <(printf '%s\n' "${DEPS[@]}" | awk 'NF && !seen[$0]++')
-
-          echo "════════ 使用 $DEPNAME 官方依赖清单，共 ${#DEPS[@]} 个包 ════════"
+          echo "════ 使用 $DEPNAME 官方依赖清单，共 ${#DEPS[@]} 个包 ════"
 
           APT="sudo -E apt-get -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
           $APT update
-          $APT install --no-install-recommends "${DEPS[@]}"
 
-          echo "════════ 依赖自检 ════════"
-          for c in gcc g++ make cmake ninja python3 pkg-config swig \
-                   dtc lld ld.lld re2c zstd ack; do
-            printf '%-12s %s\n' "$c" "$(command -v $c || echo '缺失')"
+          # 先按当前发行版实际可用的包名过滤：官方清单里个别包名在新版
+          # Ubuntu 已改名/移除，只要有一个不存在，整条 apt install 会全部失败。
+          AVAIL=(); MISSING=()
+          for p in "${DEPS[@]}"; do
+            if apt-cache show "$p" >/dev/null 2>&1; then AVAIL+=("$p"); else MISSING+=("$p"); fi
           done
-          echo "gcc     : $(gcc --version | head -1)"
-          echo "python3 : $(python3 --version)"
-          ls /usr/include/yaml.h /usr/include/gnutls/gnutls.h >/dev/null 2>&1 \
-            && echo "头文件: yaml.h / gnutls.h 就位" || true
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "⚠ 该发行版无以下包名，已跳过: ${MISSING[*]}"
+          fi
+          $APT install --no-install-recommends "${AVAIL[@]}"
 
-      # ═══════════════════════════════════════════════════════════
-      # 2. 源码（coolsnowwolf/lede 或 immortalwrt/immortalwrt）
-      #    两个源目录结构、feeds 机制、ipq40xx 设备定义完全一致，
-      #    差别只在 repo 地址和默认分支。
-      # ═══════════════════════════════════════════════════════════
-      - name: 拉取 OpenWrt 源码
+          echo "════ 关键工具自检 ════"
+          miss=""
+          for c in gcc g++ make cmake ninja python3 pkg-config swig dtc lld re2c zstd openssl; do
+            p=$(command -v "$c" 2>/dev/null || true)
+            if [ -n "$p" ]; then printf '  ✓ %-10s %s\n' "$c" "$p"
+            else printf '  ✗ %-10s 缺失\n' "$c"; miss="$miss $c"; fi
+          done
+          [ -z "$miss" ] || { echo "❌ 关键工具缺失:$miss"; exit 1; }
+          gcc --version | head -1
+          python3 --version
+
+      # ═══════════════════════════════════════════════════════════════
+      # 3. 源码（--depth 1：省时省盘，只需要一个提交）
+      # ═══════════════════════════════════════════════════════════════
+      - name: 拉取源码
         run: |
           REPO="${{ github.event.inputs.source_repo }}"
           REF="${{ github.event.inputs.source_ref }}"
-          if [ -z "$REF" ]; then
-            REF="master"   # 两个源都默认 master，与本地固件保持同源
-          fi
+          [ -n "$REF" ] || REF=master
+
           echo "repo=$REPO  ref=$REF"
           echo "SOURCE_TAG=$(echo "$REPO" | tr '/' '-')-$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
 
-          git clone "https://github.com/$REPO.git" src
+          git clone --depth 1 --single-branch --branch "$REF" \
+            "https://github.com/$REPO.git" src \
+          || { echo "浅克隆失败（可能是 SHA 或网络），改用完整克隆"; rm -rf src; \
+               git clone "https://github.com/$REPO.git" src && git -C src checkout "$REF"; }
           cd src
-          git checkout "$REF"
 
           echo "== HEAD =="
           git log -1 --format="%H  %cd  %s"
-          echo "== 目标板内核版本 =="
-          grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
           echo "== 架构 =="
           grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
-          echo "== 打包格式探测 =="
-          if [ -f include/package-ipkg.mk ]; then echo "ipkg 独立实现（老式，固定出 ipk）"; fi
-          if [ -f include/package-pack.mk ]; then echo "package-pack.mk（双格式，由 CONFIG_USE_APK 决定 ipk/apk）"; fi
-          echo -n "USE_APK 默认值: "
-          awk '/^[[:space:]]*config USE_APK/{f=1} f&&/default/{print $2; exit}' config/Config-build.in 2>/dev/null || echo "未找到（老式源码，无双格式）"
+          echo "== 内核版本 =="
+          grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
+          echo "== 打包实现 =="
+          if [ -f include/package-ipkg.mk ]; then echo "  package-ipkg.mk（老式，固定 ipk）"; fi
+          if [ -f include/package-pack.mk ]; then echo "  package-pack.mk（双格式，看 CONFIG_USE_APK）"; fi
+          USEAPK=$(awk '/^[[:space:]]*config USE_APK/{f=1} f&&/default/{print $2; exit}' \
+                    config/Config-build.in 2>/dev/null || true)
+          echo "  USE_APK 默认: ${USEAPK:-未找到（老式源码，只有 ipk）}"
 
-      # ═══════════════════════════════════════════════════════════
-      # 3. 缓存 dl（只缓存源码 tarball）
-      # ═══════════════════════════════════════════════════════════
-      - name: 缓存 dl 源码包
+          # nxhack 分支必须与源码同代，否则依赖名/ABI 对不上
+          NXBRANCH="${{ github.event.inputs.nxhack_branch }}"
+          if [ -z "$NXBRANCH" ] || [ "$NXBRANCH" = "auto" ]; then
+            case "$REF" in
+              openwrt-24.10*) NXBRANCH=openwrt-24.10 ;;
+              openwrt-25.12*) NXBRANCH=openwrt-25.12 ;;
+              *)              NXBRANCH=master ;;
+            esac
+          fi
+          echo "NXBRANCH=$NXBRANCH" >> "$GITHUB_ENV"
+          echo "=> source_ref=$REF  →  nxhack=$NXBRANCH"
+
+      # ═══════════════════════════════════════════════════════════════
+      # 4/5. 缓存
+      # ═══════════════════════════════════════════════════════════════
+      - name: 缓存 dl
         uses: actions/cache@v4
         with:
           path: src/dl
-          key: openwrt-dl-${{ hashFiles('src/include/version.mk') }}-v4
+          key: dl-${{ github.event.inputs.source_repo }}-${{ hashFiles('src/include/version.mk') }}-v5
           restore-keys: |
-            openwrt-dl-
+            dl-${{ github.event.inputs.source_repo }}-
+            dl-
 
-      # ═══════════════════════════════════════════════════════════
-      # 3.5 ccache（二次编译提速：node 及各依赖包的重编译命中缓存）
-      # ═══════════════════════════════════════════════════════════
-      - name: 恢复 ccache
+      - name: 缓存 ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-node-${{ github.event.inputs.node_major }}-${{ hashFiles('src/include/version.mk') }}-v1
-          restore-keys: ccache-node-
+          key: ccache-${{ github.event.inputs.source_repo }}-${{ github.event.inputs.node_major }}-${{ hashFiles('src/include/version.mk') }}-v5
+          restore-keys: |
+            ccache-${{ github.event.inputs.source_repo }}-${{ github.event.inputs.node_major }}-
+            ccache-
 
-      # ═══════════════════════════════════════════════════════════
-      # 4. 板级配置（只为确定目标架构 arm_cortex-a7_neon-vfpv4）
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 6. 板级配置：只需要 arm_cortex-a7_neon-vfpv4
+      # ═══════════════════════════════════════════════════════════════
       - name: 写入板级配置
         working-directory: src
         run: |
@@ -214,101 +257,67 @@ jobs:
           CONFIG_TARGET_ipq40xx=y
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
+          CONFIG_TARGET_DEVICE_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
 
           CONFIG_CCACHE=y
-
-          CONFIG_FEED_packages=y
-          CONFIG_FEED_luci=y
-          CONFIG_FEED_routing=y
-          CONFIG_FEED_telephony=y
-          CONFIG_FEED_node=y
           EOF
 
-          # 两个源都必须有这台设备，否则 defconfig 会静默回落到 Generic，
-          # 虽然架构一样能编，但明确失败更省时间
           if grep -q "asus_rt-ac42u" target/linux/ipq40xx/image/generic.mk; then
             echo "✓ 设备定义存在: asus_rt-ac42u"
           else
-            echo "❌ 该源码没有 asus_rt-ac42u 设备定义"
-            grep -E "define Device/asus" target/linux/ipq40xx/image/generic.mk || true
-            exit 1
+            echo "⚠ 该源码没有 asus_rt-ac42u，继续按 Generic 编译（架构相同，不影响 node 包）"
+            grep -oE "Device/asus_[a-z0-9_-]+" target/linux/ipq40xx/image/generic.mk || true
           fi
-          echo "板级配置已写入"
 
-      # ═══════════════════════════════════════════════════════════
-      # 5. 官方 feeds
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 7. feeds
+      # ═══════════════════════════════════════════════════════════════
       - name: 安装官方 feeds
         working-directory: src
         run: |
-          ./scripts/feeds update -a
+          ok=0
+          for i in 1 2; do
+            if ./scripts/feeds update -a; then ok=1; break; fi
+            echo "feeds update 第 $i 次失败"
+          done
+          [ "$ok" = 1 ] || { echo "❌ feeds update 连续失败"; exit 1; }
           ./scripts/feeds install -a
-          echo "== 源码自带 node 检查 =="
-          # lede / immortalwrt 的 packages feed 都有 node；即便没有也不影响
-          # （nxhack feed 会提供 node），所以这里只做提示不失败
           ls -d package/feeds/packages/node 2>/dev/null || echo "（packages feed 无 node，将以 nxhack 为准）"
 
-      # ═══════════════════════════════════════════════════════════
-      # 6. 接入 nxhack —— 严格按官方 README 五步
-      #
-      #    ① feeds.conf.default 加 src-git node <url>
-      #    ② ./scripts/feeds update node
-      #    ③ rm package/feeds/packages/node
-      #       rm package/feeds/packages/node-*
-      #    ④ ./scripts/feeds install -a -p node
-      #    ⑤ make defconfig
-      #
-      #    注意：-p 后面是 feed 名（src-git 的第二个字段），不是包名。
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 8. nxhack（按 README 五步）
+      # ═══════════════════════════════════════════════════════════════
       - name: 接入 nxhack node feed
         working-directory: src
         run: |
-          NXBRANCH="${{ github.event.inputs.nxhack_branch }}"
+          NXBRANCH="${NXBRANCH}"
           echo "nxhack 分支: $NXBRANCH"
 
-          # ① 登记 feed
           sed -i '/openwrt-node-packages/d' feeds.conf.default
           echo "src-git node https://github.com/nxhack/openwrt-node-packages.git;$NXBRANCH" >> feeds.conf.default
-          echo "===== feeds.conf.default ====="
           cat feeds.conf.default
 
-          # ② 更新该 feed
           ./scripts/feeds update node
 
-          # ③ 删除 coolsnowwolf 自带 node 与全部 node-* 包
+          # 删掉 packages feed 自带的 node / node-*
           rm -rf package/feeds/packages/node
           rm -rf package/feeds/packages/node-*
 
-          # ④ 从 node feed 安装全部包
           ./scripts/feeds install -a -p node
 
-          # ⑤ 校验
-          echo "===== 校验 nxhack 落地 ====="
           test -d package/feeds/node/node || { echo "❌ package/feeds/node/node 不存在"; exit 1; }
-          ls package/feeds/node/ | head -10
-          echo "===== nxhack 分支与提交 ====="
-          git -C feeds/node log -1 --format="%H %cd %s" 2>/dev/null || echo "(feeds 目录非 git)"
-          echo "===== node Makefile 版本 ====="
-          grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
+          ls package/feeds/node/
+          git -C feeds/node log -1 --format="%H %cd %s" 2>/dev/null || true
+          grep -E "^PKG_VERSION|^PKG_RELEASE" package/feeds/node/node/Makefile || true
 
-      # ═══════════════════════════════════════════════════════════
-      # 7. 选定 node 主版本并 defconfig（只做一次，之后绝不改 .config）
-      #
-      #    nxhack 的 node Makefile 用 choice 控制版本，且列表随分支/更新变化
-      #    （实测 2026-11）：
-      #      openwrt-24.10 : 20 / 22 / 24（默认 22）
-      #      openwrt-25.12 : 22 / 24 / 26（默认 24）
-      #      master        : 22 / 24 / 26（默认 24）
-      #    ABI 号决定产物包名前缀：
-      #      20.x→node115  22.x→node127  24.x→node137  26.x→node147
-      #    从来没有 23（奇数版本非 LTS）。
-      #    所以下面「选择版本」步骤必须校验，收集步骤必须动态匹配 node<ABI>_。
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 9. 选版本 + defconfig + 格式判定
+      # ═══════════════════════════════════════════════════════════════
       - name: 选择 node 版本并 defconfig
         working-directory: src
         run: |
           MAJOR="${{ github.event.inputs.node_major }}"
-          echo "════════ 选择 node ${MAJOR}.x ════════"
+          echo "════ 目标 node ${MAJOR}.x ════"
 
           cat >> .config <<EOF
           CONFIG_NODEJS_${MAJOR}=y
@@ -321,162 +330,141 @@ jobs:
 
           make defconfig
 
-          # ① 版本必须真的生效：feed 分支不支持该版本时，symbol 会被
-          #    defconfig 静默丢掉，回落默认 24 —— 那就会编错版本还看不出来
           if ! grep -q "^CONFIG_NODEJS_${MAJOR}=y" .config; then
-            echo "❌ 当前 nxhack 分支不支持 node ${MAJOR}.x"
-            echo "---- .config 里的 NODEJS 选项 ----"
+            echo "❌ 该 nxhack 分支不支持 node ${MAJOR}.x"
             grep -E "^CONFIG_NODEJS_|^# CONFIG_NODEJS_" .config || true
-            echo "---- Makefile 支持的版本 ----"
+            echo "---- Makefile 支持列表 ----"
             grep -nE "config NODEJS_|default NODEJS_" package/feeds/node/node/Makefile || true
             echo "提示：openwrt-24.10 → 20/22/24；openwrt-25.12 或 master → 22/24/26"
             exit 1
           fi
 
-          # ② 打包格式：完全按源码自身设定，不做任何干预。
-          #    lede / immortalwrt-24.10 → ipk（opkg）
-          #    immortalwrt master 等新分支 → apk（USE_APK default y）
-          #    只为后续收集/索引步骤记录实际格式，不改 .config。
+          # 格式：完全按源码自身设定，不改 CONFIG_USE_APK
+          PKG_FORMAT=ipk
           if grep -q "^CONFIG_USE_APK=y" .config; then
             PKG_FORMAT=apk
-            echo "✅ 打包格式: apk（源码自身设定，产物 .apk）"
-          else
-            PKG_FORMAT=ipk
-            echo "✅ 打包格式: ipk（源码自身设定，产物 .ipk）"
+          elif [ ! -f include/package-ipkg.mk ] && grep -q "config USE_APK" config/Config-build.in; then
+            PKG_FORMAT=apk
           fi
           echo "PKG_FORMAT=$PKG_FORMAT" >> "$GITHUB_ENV"
+          echo "✅ 打包格式: $PKG_FORMAT（源码自身设定）"
 
-          echo "════════ 最终配置核对 ════════"
-          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
-          grep -E "^CONFIG_NODEJS_" .config || echo "⚠ 无 NODEJS_ 项"
-          grep -E "^CONFIG_PACKAGE_node" .config || echo "⚠ node 未选中"
-          grep -q "^CONFIG_PACKAGE_libopenssl-legacy=y" .config \
-            && echo "libopenssl-legacy: 已选中" \
-            || echo "libopenssl-legacy: 该源码没有此包，跳过"
+          echo "════ 配置核对 ════"
+          grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=|CONFIG_USE_APK|CONFIG_SIGN_EACH_PACKAGE" .config || true
+          grep -E "^CONFIG_NODEJS_" .config || true
+          grep -E "^CONFIG_PACKAGE_node" .config || true
+          echo "架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)"
 
-          echo "════════ Makefile 版本分支 ════════"
-          grep -nE "^PKG_VERSION|^NODE_MODULE_VERSION|^ifeq \(\\\$\(CONFIG_NODEJS_" \
-            package/feeds/node/node/Makefile || true
-          echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2 || echo '未知')"
-
-      # ═══════════════════════════════════════════════════════════
-      # 8. 下载源码包（node tarball 约 90MB）
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 10. 下载 node 源码包（~90MB）
+      # ═══════════════════════════════════════════════════════════════
       - name: 下载 node 源码包
         working-directory: src
         run: |
           make package/feeds/node/node/download V=s || true
-          echo "== dl 中的 node =="
-          ls -lh dl/ | grep -iE "node-v|nodebin" || echo "⚠ 未见 node 源码包"
+          ls -lh dl/ | grep -iE "node-v|nodebin" || echo "⚠ 未见 node 源码包（编译时会再取）"
 
-      # ═══════════════════════════════════════════════════════════
-      # 9. 编译工具链
-      #    -j2 保守（编 gcc 时单进程内存峰值高，-j4 在 16G runner 上易 OOM）
-      #    日志落盘 /tmp/toolchain-build.log，失败时也能下载
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 11. 工具链
+      #     CMAKE_POLICY_VERSION_MINIMUM：runner 的 CMake 新版本会拒收
+      #     cmake_minimum_required<3.5 的老项目（tools/dwarves 等）
+      # ═══════════════════════════════════════════════════════════════
       - name: 编译工具链
         working-directory: src
         run: |
-          # GitHub runner 的 CMake 是 4.x，会拒绝 cmake_minimum_required < 3.5 的老项目
-          # （本次失败点：tools/dwarves）。设此变量让 CMake 4 兼容 3.5 策略。
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
           ulimit -n 4096
-          echo "════════ 资源检查 ════════"
-          free -h
+          echo "线程数: ${{ github.event.inputs.threads }}"
           df -h .
-          nproc
-          cmake --version
-          echo "════════ 本次编译线程数: ${{ github.event.inputs.threads }} ════════"
-          echo "════════ tools/install 开始 $(date -u +%H:%M:%S) ════════"
           set -o pipefail
           make tools/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/toolchain-build.log
-          echo "════════ tools/install 完成 $(date -u +%H:%M:%S) ════════"
-          echo "════════ toolchain/install 开始 $(date -u +%H:%M:%S) ════════"
           make toolchain/install -j${{ github.event.inputs.threads }} V=s 2>&1 | tee -a /tmp/toolchain-build.log
-          echo "════════ toolchain/install 完成 $(date -u +%H:%M:%S) ════════"
-          echo "== 磁盘剩余 =="
           df -h .
 
-      # ═══════════════════════════════════════════════════════════
-      # 10. ⚠ 关键新增：先编译内核
-      #
-      #     上一轮失败的真正原因：make node/compile 会触发全量依赖，
-      #     其中包含 package/kernel/linux，而 kmod-pppox 需要
-      #     linux-5.10.272/drivers/net/ppp/pppox.ko
-      #     → 内核没编 → .ko 不存在 → kmod 打包失败 → Error 2
-      #
-      #     这里先把内核编出来，kmod 才能正常打包。
-      # ═══════════════════════════════════════════════════════════
-      - name: 编译内核（kmod 依赖前置）
+      # ═══════════════════════════════════════════════════════════════
+      # 12. 内核（kmod 打包前置；顺便验证工具链真的能用）
+      # ═══════════════════════════════════════════════════════════════
+      - name: 编译内核
         working-directory: src
         run: |
           ulimit -n 4096
-          echo "════════ 内核编译开始（线程数 ${{ github.event.inputs.threads }}）: $(date -u +%H:%M:%S) ════════"
           set -o pipefail
-          make target/linux/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/kernel-build.log | tail -50
-          echo "内核编译结束: $(date -u +%H:%M:%S)"
-          echo "== 产物核验 =="
+          make target/linux/compile -j${{ github.event.inputs.threads }} V=s 2>&1 \
+            | tee /tmp/kernel-build.log | tail -30
           for f in vmlinux modules.builtin drivers/net/ppp/pppox.ko; do
             p=$(ls build_dir/target-*/linux-ipq40xx_generic/linux-*/$f 2>/dev/null | head -1)
-            if [ -n "$p" ]; then echo "✓ $f"; else echo "✗ $f 缺失"; fi
+            [ -n "$p" ] && echo "✓ $f" || echo "· $f 未生成（不一定需要）"
           done
 
-      # ═══════════════════════════════════════════════════════════
-      # 11. 预编译 host 依赖
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 13. host 依赖
+      # ═══════════════════════════════════════════════════════════════
       - name: 预编译 host 依赖
         working-directory: src
         run: |
           ulimit -n 4096
-          make package/feeds/packages/python3/host/compile -j${{ github.event.inputs.threads }} V=s || true
+          make package/feeds/packages/python3/host/compile \
+            -j${{ github.event.inputs.threads }} V=s || true
 
-      # ═══════════════════════════════════════════════════════════
-      # 12. 编译 node 包（产物格式由源码自身决定：ipk 或 apk）
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 14. 编译 node
+      #     apk 模式下若 SIGN_EACH_PACKAGE=y，mkpkg 需要 private-key.pem，
+      #     而单包编译不会触发密钥生成（只有整树 package/compile 才会），
+      #     这里按 package/Makefile 的定义自己补上，避免签名失败。
+      # ═══════════════════════════════════════════════════════════════
       - name: 编译 node 包
         working-directory: src
         run: |
           set -o pipefail
           ulimit -n 4096
-          echo "════════ 目标: node ${{ github.event.inputs.node_major }}.x / 线程数 ${{ github.event.inputs.threads }} / 开始 $(date -u +%H:%M:%S) ════════"
-          make package/feeds/node/node/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/node-build.log
-          echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
 
-      # ═══════════════════════════════════════════════════════════
-      # 13. 收集产物（自动适配 ipk / apk 两种格式）
-      #
-      #     ipk:  <pkg><ABI>_<ver>_<arch>.ipk     （lede、immortalwrt-24.10）
-      #     apk:  <pkg><ABI>-<ver>.apk            （immortalwrt master 等）
-      #     格式由前一步写入的 PKG_FORMAT 决定，完全跟随源码自身设定。
-      #
-      #     node 本体包名前缀 = ABI 号，随主版本变化：
-      #       node127（22.x）/ node137（24.x）/ node147（26.x）
-      #     所以只能用 node<数字> 通配，绝不能写死 node137。
-      #
-      #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
-      #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
-      #                 +libcares +libatomic
-      # ═══════════════════════════════════════════════════════════
-      - name: 收集产物（node + npm + 全部运行时依赖）
+          if [ "${PKG_FORMAT}" = "apk" ] && grep -q "^CONFIG_SIGN_EACH_PACKAGE=y" .config; then
+            if [ ! -f private-key.pem ]; then
+              echo "生成 apk 签名密钥（SIGN_EACH_PACKAGE=y）"
+              openssl ecparam -name prime256v1 -genkey -noout -out private-key.pem
+            fi
+            [ -f public-key.pem ] || openssl ec -in private-key.pem -pubout -out public-key.pem
+          fi
+
+          echo "════ node ${{ github.event.inputs.node_major }}.x / ${PKG_FORMAT} / -j${{ github.event.inputs.threads }} ════"
+          make package/feeds/node/node/compile -j${{ github.event.inputs.threads }} V=s 2>&1 \
+            | tee /tmp/node-build.log
+
+      # ═══════════════════════════════════════════════════════════════
+      # 15. 收集产物
+      #     格式以「实际产物」为准（探测与实际冲突时自动纠正，不再靠假设）
+      #     依赖清单从 node Makefile 的 DEPENDS 读取，避免写死包名
+      # ═══════════════════════════════════════════════════════════════
+      - name: 收集产物
         working-directory: src
         run: |
           mkdir -p out
-
           ARCH=$(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)
           [ -n "$ARCH" ] || ARCH=arm_cortex-a7_neon-vfpv4
-          FMT="${PKG_FORMAT:-ipk}"
-          echo "包架构: $ARCH    打包格式: $FMT"
 
           PKGDIR="bin/packages/$ARCH/node"
           if [ ! -d "$PKGDIR" ]; then
-            echo "⚠ $PKGDIR 不存在，全局搜索 node 包所在目录"
             hit=$(find bin/packages -maxdepth 3 -type f \
-                    \( -name 'node[0-9]*_*.ipk' -o -name 'node[0-9]*-*.apk' \) \
-                    2>/dev/null | head -1)
-            [ -n "$hit" ] && PKGDIR=$(dirname "$hit")
+                    \( -name 'node[0-9]*_*.ipk' -o -name 'node[0-9]*-*.apk' \) 2>/dev/null | head -1)
+            [ -n "$hit" ] && PKGDIR=$(dirname "$hit") || true
           fi
-          echo "════════ 包目录: $PKGDIR ════════"
+          echo "包目录: $PKGDIR"
           ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
+
+          # ---- 用真实文件判断格式（不信任何探测结果）----
+          has_apk=$(ls "$PKGDIR"/node[0-9]*-*.apk 2>/dev/null | wc -l)
+          has_ipk=$(ls "$PKGDIR"/node[0-9]*_*.ipk 2>/dev/null | wc -l)
+          if [ "$has_apk" -gt 0 ]; then
+            FMT=apk
+          elif [ "$has_ipk" -gt 0 ]; then
+            FMT=ipk
+          else
+            echo "❌ 目录里既没有 node*.apk 也没有 node*.ipk"
+            ls -lh "$PKGDIR"
+            exit 1
+          fi
+          echo "实际格式: $FMT   包架构: $ARCH"
+          echo "PKG_FORMAT=$FMT" >> "$GITHUB_ENV"
 
           shopt -s nullglob
           if [ "$FMT" = "apk" ]; then
@@ -488,108 +476,125 @@ jobs:
           fi
           shopt -u nullglob
 
-          if [ ${#NODE_PKGS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node<ABI> 本体包（格式 $FMT），目录实际内容："
-            ls -lh "$PKGDIR"
-            exit 1
-          fi
-          if [ ${#NPM_PKGS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node-npm 包（格式 $FMT）"
-            exit 1
-          fi
-          cp -v "${NODE_PKGS[@]}" out/
-          cp -v "${NPM_PKGS[@]}" out/
+          [ ${#NODE_PKGS[@]} -gt 0 ] || { echo "❌ 没找到 node<ABI> 本体"; exit 1; }
+          [ ${#NPM_PKGS[@]} -gt 0 ]  || { echo "❌ 没找到 node-npm"; exit 1; }
+          cp -v "${NODE_PKGS[@]}" "${NPM_PKGS[@]}" out/
 
-          # 运行时依赖（包名来自 DEPENDS；版本号通配）
-          # ipk 用 _ 分隔、apk 用 - 分隔；libc 单独写，避免误匹配 libcares
-          for pat in libstdcpp6 libatomic1 libgcc1 libc zlib \
-                     libopenssl3 libopenssl-conf libopenssl-legacy \
-                     libnghttp2-14 libcares; do
+          # ---- 依赖名：从 Makefile 的 DEPENDS 解析 ----
+          MK=package/feeds/node/node/Makefile
+          DEPNAMES=$(awk '
+            {
+              line = $0
+              if (!inf && line ~ /^[ \t]*DEPENDS[ \t]*:?=/) inf = 1
+              if (inf) {
+                cont = (line ~ /\\[ \t]*$/)
+                sub(/\\[ \t]*$/, "", line)
+                gsub(/[ \t]+/, " ", line)
+                buf = buf " " line
+                if (!cont) { print buf; inf = 0; buf = "" }
+              }
+            }' "$MK" \
+            | sed 's/^[^=]*=[ \t]*//' | tr ' ' '\n' | sed 's/^+//' \
+            | grep -E '^[A-Za-z0-9][A-Za-z0-9._+-]*$' \
+            | grep -vE '^(node|node-any)$' | sort -u)
+          echo "DEPENDS 解析: $(echo $DEPNAMES)"
+
+          copy_dep() {
+            d="$1"
             if [ "$FMT" = "apk" ]; then
-              find bin/packages bin/targets -name "${pat}-*.apk" \
-                -exec cp -v {} out/ \; 2>/dev/null || true
+              find bin/packages bin/targets -maxdepth 5 -type f \
+                \( -name "${d}-*.apk" -o -name "${d}[0-9]*-*.apk" \) \
+                -exec cp -f {} out/ \; 2>/dev/null || true
             else
-              find bin/packages bin/targets -name "${pat}_*.ipk" \
-                -exec cp -v {} out/ \; 2>/dev/null || true
-            fi
-          done
-
-          echo "════════ out/ ════════"
-          ls -lh out/
-
-          # 判定某依赖是否已收集到（兼容两种扩展名）
-          have() {
-            if [ "$FMT" = "apk" ]; then
-              ls out/"$1"-*.apk > /dev/null 2>&1
-            else
-              ls out/"$1"_*.ipk > /dev/null 2>&1
+              find bin/packages bin/targets -maxdepth 5 -type f \
+                \( -name "${d}_*.ipk" -o -name "${d}[0-9]*_*.ipk" \) \
+                -exec cp -f {} out/ \; 2>/dev/null || true
             fi
           }
 
-          # 硬校验：Makefile DEPENDS 里必有的六个
-          for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
-            have "$need" || { echo "❌ 缺依赖 $need"; exit 1; }
+          # 注意：libc / libgcc1 故意不随包 —— 它们是固件基础件，
+          # 版本不一致时装上去比不装更危险，路由器本来就有。
+          for d in $DEPNAMES libstdcpp libatomic zlib \
+                   libopenssl libopenssl-conf libopenssl-legacy \
+                   libnghttp2 libcares; do
+            case "$d" in libc|libgcc1) continue ;; esac
+            copy_dep "$d"
           done
-          # 可选依赖：.config 里选中了就必须有产物
-          for need in libopenssl-conf libopenssl-legacy; do
-            if grep -q "^CONFIG_PACKAGE_${need}=y" .config; then
-              have "$need" || { echo "❌ 缺依赖 $need"; exit 1; }
+
+          echo "════ 依赖核对 ════"
+          for d in $DEPNAMES; do
+            if [ "$FMT" = "apk" ]; then
+              n=$(ls out/"$d"-*.apk out/"$d"[0-9]*-*.apk 2>/dev/null | wc -l)
+            else
+              n=$(ls out/"$d"_*.ipk out/"$d"[0-9]*_*.ipk 2>/dev/null | wc -l)
+            fi
+            if [ "$n" -gt 0 ]; then
+              printf '  ✓ %-22s %s 个\n' "$d" "$n"
+            else
+              printf '  · %-22s 未随包（路由器现有源可提供）\n' "$d"
             fi
           done
 
-          # 从真实文件名反解 ABI 与版本（架构名里也有下划线，不能用贪婪匹配）
+          # 只有「.config 里明确选中」的可选依赖，缺了才算失败
+          for need in libopenssl-conf libopenssl-legacy; do
+            if grep -q "^CONFIG_PACKAGE_${need}=y" .config; then
+              if [ "$FMT" = "apk" ]; then
+                ls out/"$need"-*.apk >/dev/null 2>&1 || { echo "❌ 已选中但缺 $need"; exit 1; }
+              else
+                ls out/"$need"_*.ipk >/dev/null 2>&1 || { echo "❌ 已选中但缺 $need"; exit 1; }
+              fi
+            fi
+          done
+
+          # 反解 ABI / 版本
           NODE_FILE=$(basename "${NODE_PKGS[0]}")
           if [ "$FMT" = "apk" ]; then
-            # node137-24.22.2-1.apk
-            _b="${NODE_FILE%.apk}"
+            _b="${NODE_FILE%.apk}"                 # node137-24.22.2-r1
             NODE_ABI="${_b#node}"; NODE_ABI="${NODE_ABI%%-*}"
             NODE_VER="${_b#node${NODE_ABI}-}"
           else
-            # node137_24.22.2-1_arm_cortex-a7_neon-vfpv4.ipk
-            _b="${NODE_FILE%.ipk}"
+            _b="${NODE_FILE%.ipk}"                 # node137_24.22.2-1_arm_...
             NODE_ABI="${_b#node}"; NODE_ABI="${NODE_ABI%%_*}"
             NODE_VER="${_b#node${NODE_ABI}_}"
             NODE_VER="${NODE_VER%_${ARCH}}"
           fi
 
-          echo "✅ 收集完成，共 $(ls out/*.$FMT 2>/dev/null | wc -l) 个 .$FMT"
-          echo "node 本体: $NODE_FILE  (ABI=$NODE_ABI, version=$NODE_VER)"
-          sha256sum out/* 2>/dev/null || true
-
+          echo "════ out/ 共 $(ls out/*.$FMT 2>/dev/null | wc -l) 个 .$FMT ════"
+          echo "本体: $NODE_FILE  (ABI=$NODE_ABI  version=$NODE_VER)"
+          ls -lh out/
           {
             echo "NODE_VER=$NODE_VER"
             echo "NODE_ABI=$NODE_ABI"
           } >> "$GITHUB_ENV"
 
-      # ═══════════════════════════════════════════════════════════
-      # 14. 生成源索引（跟随源码的打包格式）
-      #       ipk → opkg 的 Packages / Packages.gz（下面自带的解析器）
-      #       apk → apk-tools 的 APKINDEX.tar.gz（调 host apk index）
-      #
-      #     ipk 的两种封装都要支持：
-      #       ① 新格式：整个 ipk 是 gzip tar，内含 ./control.tar.gz
-      #       ② 老格式：ar 归档，内含 control.tar.gz
-      #     先看文件头魔数判断，避免 ar 报错直接中断。
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 16. 索引
+      #     apk：apk mkndx → packages.adb（apk-tools 3，immortalwrt master）
+      #     ipk：自写解析器 → Packages / Packages.gz（含 opkg 字段顺序修正）
+      # ═══════════════════════════════════════════════════════════════
       - name: 生成源索引
         if: github.event.inputs.gen_index == 'true'
         working-directory: src/out
         run: |
           FMT="${PKG_FORMAT:-ipk}"
-          echo "打包格式: $FMT"
+          echo "格式: $FMT"
 
           if [ "$FMT" = "apk" ]; then
-            echo "════════ apk 模式：生成 APKINDEX.tar.gz ════════"
             APKBIN=../staging_dir/host/bin/apk
-            if [ -x "$APKBIN" ] && ls *.apk >/dev/null 2>&1; then
-              if "$APKBIN" index -o APKINDEX.tar.gz *.apk; then
-                ls -lh APKINDEX.tar.gz
-                echo "✅ apk 索引生成完成（apk 源目录放 APKINDEX.tar.gz + 全部 .apk）"
-              else
-                echo "⚠ apk index 执行失败，跳过索引（不影响直接装 .apk 文件）"
-              fi
+            [ -x "$APKBIN" ] || { echo "❌ 缺 host apk：$APKBIN"; exit 1; }
+            echo "apk: $("$APKBIN" --version 2>&1 | head -1)"
+            ls *.apk >/dev/null 2>&1 || { echo "❌ 没有 .apk"; exit 1; }
+
+            # 与 immortalwrt package/Makefile 的 $(curdir)/merge-index 一致
+            if "$APKBIN" mkndx --root .. --keys-dir .. --allow-untrusted \
+                 --output packages.adb *.apk; then
+              ls -lh packages.adb
+              echo "──── 索引内容（抽查）────"
+              "$APKBIN" adbdump packages.adb 2>/dev/null | grep -E "name:|version:" | head -20 || true
+              echo "✅ packages.adb 就绪（apk-tools 3 源索引）"
             else
-              echo "⚠ 未找到 host apk 工具或无 apk 包，跳过索引"
+              echo "❌ apk mkndx 失败"
+              exit 1
             fi
             exit 0
           fi
@@ -598,7 +603,6 @@ jobs:
           import glob, hashlib, io, os, subprocess, tarfile, traceback
 
           def control_from_tar(fileobj):
-              """从 control.tar.* 里取出 control 文本"""
               with tarfile.open(fileobj=fileobj, mode="r:*") as t:
                   for m in t.getnames():
                       if m.rstrip("/").split("/")[-1] == "control":
@@ -608,17 +612,15 @@ jobs:
           def read_control(path):
               with open(path, "rb") as f:
                   magic = f.read(8)
-
-              # ① 新格式：gzip tar（OpenWrt 24.10+）
+              # 新格式：整包是 gzip tar（24.10+）
               if magic[:2] == b"\x1f\x8b" or magic[:5] == b"\xfd7zXZ":
                   with tarfile.open(path, "r:*") as t:
                       for m in t.getnames():
                           base = m.rstrip("/").split("/")[-1]
                           if base.startswith("control.tar"):
                               return control_from_tar(io.BytesIO(t.extractfile(m).read()))
-                  raise RuntimeError("外层 tar 中无 control.tar")
-
-              # ② 老格式：ar 归档
+                  raise RuntimeError("外层 tar 无 control.tar")
+              # 老格式：ar 归档
               if magic[:7] == b"!<arch>":
                   members = subprocess.run(["ar", "t", path], capture_output=True,
                                            text=True, check=True).stdout.split()
@@ -628,12 +630,10 @@ jobs:
                   raw = subprocess.run(["ar", "p", path, ctl[0]],
                                        capture_output=True, check=True).stdout
                   return control_from_tar(io.BytesIO(raw))
-
               raise RuntimeError("未知 ipk 封装，文件头=%r" % magic)
 
           def parse(ctl):
-              fields, desc = {}, []
-              cur = None
+              fields, desc, cur = {}, [], None
               for line in ctl.splitlines():
                   if line.startswith(" ") or (line == "" and desc):
                       if cur == "Description":
@@ -652,12 +652,9 @@ jobs:
                   if "Package" not in fields or "Version" not in fields:
                       raise RuntimeError("control 缺 Package/Version")
                   out = []
-                  # 顺序必须与官方 Packages 一致：Filename/Size/SHA256sum
-                  # 一定放在 Description 之前。opkg 解析 Description 时会
-                  # 把后续以空格开头的行当作描述续行，遇到空行即判定记录
-                  # 结束；一旦描述块的续行边界有任何偏差，排在 Description
-                  # 之后的字段就会被吞掉，导致 opkg install 报
-                  # "does not have a valid filename field"。
+                  # Filename/Size/SHA256sum 必须在 Description 之前：
+                  # opkg 解析 Description 时遇空行即结束记录，排在其后的字段会被吞，
+                  # 表现就是 "does not have a valid filename field"
                   for k in ["Package", "Version", "Depends", "Provides",
                             "Conflicts", "Architecture", "Installed-Size"]:
                       if k in fields:
@@ -666,8 +663,6 @@ jobs:
                   out.append("Size: %d" % os.path.getsize(ipk))
                   out.append("SHA256sum: %s"
                              % hashlib.sha256(open(ipk, "rb").read()).hexdigest())
-                  # Description 永远放最后，续行统一 " ."（空行）表示，
-                  # 去掉末尾多余的 " ."，避免多出一个空描述行
                   head = fields.get("Description", "").rstrip()
                   body = list(desc)
                   while body and body[-1].strip() in ("", "."):
@@ -684,80 +679,81 @@ jobs:
 
           with open("Packages", "w") as f:
               f.write("".join(entries))
-          print("\n完成: %d 个包入索引, %d 个失败" % (len(entries), len(failed)))
+          print("\n完成: %d 入索引, %d 失败" % (len(entries), len(failed)))
 
-          # 自校验：按 opkg 的方式（空行分条）逐条检查关键字段，
-          # 少一个就失败，避免又生成一份装不上的索引
           blocks = [b for b in open("Packages").read().split("\n\n") if b.strip()]
           bad = []
           for b in blocks:
-              lines_b = b.splitlines()
-              tag = lines_b[0] if lines_b else "?"
+              lb = b.splitlines()
               for need in ("Package", "Version", "Architecture",
                            "Filename", "Size", "SHA256sum"):
-                  if not any(l.startswith(need + ":") for l in lines_b):
-                      bad.append("%s 缺 %s" % (tag, need))
+                  if not any(l.startswith(need + ":") for l in lb):
+                      bad.append("%s 缺 %s" % (lb[0] if lb else "?", need))
           if bad:
-              print("✗ 索引自校验失败：")
-              for x in bad:
-                  print("   " + x)
+              print("✗ 自校验失败：")
+              [print("   " + x) for x in bad]
               raise SystemExit(1)
-          print("✓ 索引自校验通过：%d 条，字段齐全" % len(blocks))
+          print("✓ 自校验通过：%d 条，字段齐全" % len(blocks))
 
-          # 只有 node 本体读不出来才算致命；依赖包个别失败不影响
           if not glob.glob("node[0-9]*_*.ipk"):
-              raise SystemExit("❌ out/ 中没有 node<ABI>_*.ipk")
+              raise SystemExit("❌ 没有 node<ABI>_*.ipk")
           if failed:
-              raise SystemExit("❌ 以下 ipk 无法解析: %s" % " ".join(failed))
+              raise SystemExit("❌ 无法解析: %s" % " ".join(failed))
           PYEOF
           gzip -kf Packages
           ls -lh Packages Packages.gz
-          echo "════════ Packages 内容预览 ════════"
-          grep -E "^Package:|^Version:|^Size:" Packages || true
+          grep -E "^Package:|^Version:" Packages || true
 
-      # ═══════════════════════════════════════════════════════════
-      # 15. 发布到 Releases（可选，由 make_release 开关控制）
-      # ═══════════════════════════════════════════════════════════
+      # ═══════════════════════════════════════════════════════════════
+      # 17. 发布
+      # ═══════════════════════════════════════════════════════════════
       - name: 发布到 Releases
         if: github.event.inputs.make_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: node-v${{ env.NODE_VER || 'latest' }}
-          name: node ${{ env.NODE_VER || 'latest' }} (arm_cortex-a7_neon-vfpv4)
+          name: node ${{ env.NODE_VER || 'latest' }} (${{ env.NODE_ABI || '?' }}) arm_cortex-a7_neon-vfpv4
           body: |
-            nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17
-            （ipq40xx，arm_cortex-a7_neon-vfpv4）
+            nxhack node ${{ env.NODE_VER || 'latest' }}（ABI ${{ env.NODE_ABI || '?' }}）
+            目标：ASUS RT-AC42U / RT-ACRH17，ipq40xx，arm_cortex-a7_neon-vfpv4
 
-            - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || 'master（默认）' }}
-            - node 主版本：${{ github.event.inputs.node_major }}.x（ABI ${{ env.NODE_ABI || '?' }}）
-            - nxhack feed：${{ github.event.inputs.nxhack_branch }}
-            - 打包格式：${{ env.PKG_FORMAT || 'ipk' }}（跟随源码自身设定）
+            - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || 'master' }}
+            - nxhack：${{ env.NXBRANCH }}
+            - 打包格式：${{ env.PKG_FORMAT }}（跟随源码自身设定）
+            - 主版本：${{ github.event.inputs.node_major }}.x
 
-            安装（按你的固件格式选一种，依赖包已随附）：
+            安装（依赖已随附；libc / libgcc1 属于固件基础件，刻意不打包）：
 
-            - apk 固件：
-              `apk add --allow-untrusted node${{ env.NODE_ABI }}-*.apk node-npm-*.apk`
-            - ipk 固件：
-              `opkg install node${{ env.NODE_ABI }}_*.ipk node-npm_*.ipk`
-            - 已配好自建源：
-              apk → `APKINDEX.tar.gz` + 全部 .apk；opkg → `Packages` + `Packages.gz` + 全部 .ipk
-              之后 `apk update` 或 `opkg update`，再装 `node${{ env.NODE_ABI }}`
+            apk 固件（immortalwrt master, apk-tools 3）：
+            ```
+            apk add --allow-untrusted ./*.apk
+            ```
+            ipk 固件：
+            ```
+            opkg install ./*.ipk
+            ```
+
+            自建源：
+            - apk：`packages.adb` 与全部 `.apk` 放同一目录，`/etc/apk/repositories`
+              写**到文件的完整 URL**（如 `https://host/node/packages.adb`）。
+              apk 3 靠 `.adb` 后缀判定索引类型，写目录会去找老式 APKINDEX.tar.gz。
+            - ipk：`Packages` + `Packages.gz` + 全部 `.ipk`。
           files: |
             src/out/*
 
-      # ═══════════════════════════════════════════════════════════
-      # 16. 上传：无论索引是否成功，产物都要传出来（不让 4 小时白跑）
-      # ═══════════════════════════════════════════════════════════
-      - name: 上传产物 + 索引
+      # ═══════════════════════════════════════════════════════════════
+      # 18. 兜底上传
+      # ═══════════════════════════════════════════════════════════════
+      - name: 上传产物
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: node-${{ env.NODE_VER || 'latest' }}-${{ env.SOURCE_TAG || 'src' }}-arm_cortex-a7_neon-vfpv4
+          name: node-${{ env.NODE_VER || 'latest' }}-${{ env.PKG_FORMAT || 'pkg' }}-${{ env.SOURCE_TAG || 'src' }}
           path: src/out/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: 上传全部编译日志（无论成败）
+      - name: 上传日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
