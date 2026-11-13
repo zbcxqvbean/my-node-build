@@ -78,28 +78,47 @@ jobs:
 
     steps:
       # ═══════════════════════════════════════════════════════════
-      # 1. 主机依赖（OpenWrt 官方清单 + nxhack 额外要求）
-      #    nxhack README 明确要求：gcc-multilib / g++-multilib / libatomic
+      # 1. 主机依赖
+      #    = immortalwrt 官方 install-deps 清单（全量，不精简）
+      #      + coolsnowwolf/lede 额外项（libfuse-dev / libnsl-dev / xz-utils）
+      #      + nxhack README 要求（gcc-multilib / g++-multilib / libatomic1）
+      #    包名已按 Ubuntu 24.04 (noble) 实测校正：
+      #      gnutls-dev      是虚拟包 → 用实体名 libgnutls28-dev
+      #      libncurses5-dev / libncursesw5-dev 是 transitional → 用 libncurses-dev
+      #      libz-dev        由 zlib1g-dev 提供（已含）
+      #      mkisofs         由 genisoimage 提供（已含）
       # ═══════════════════════════════════════════════════════════
       - name: 安装主机依赖
         timeout-minutes: 30   # 超过 30 分钟必是卡死，快速失败而非挂 5 小时
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          sudo -E apt-get update -y
-          sudo -E apt-get install -y --no-install-recommends \
+          APT="sudo -E apt-get -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          $APT update
+          $APT install --no-install-recommends \
             ack antlr3 asciidoc autoconf automake autopoint binutils bison \
             build-essential bzip2 ccache clang cmake cpio curl \
-            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
-            genisoimage git gperf haveged help2man intltool libc6-dev-i386 \
-            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
-            libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz \
-            libnsl-dev ninja-build p7zip p7zip-full patch pkgconf python3 \
-            python3-pyelftools python3-setuptools qemu-utils rsync scons \
-            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
-            vim wget xmlto xxd xz-utils zlib1g-dev libatomic1
-          echo "gcc: $(gcc --version | head -1)"
-          echo "python3: $(python3 --version)"
+            device-tree-compiler ecj fastjar flex gawk \
+            g++-multilib gcc-multilib genisoimage gettext git \
+            gperf haveged help2man intltool \
+            lib32gcc-s1 libatomic1 libc6-dev-i386 libelf-dev libfuse-dev \
+            libglib2.0-dev libgmp3-dev libgnutls28-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libnsl-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev \
+            lld llvm lrzsz msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf python3 python3-docutils \
+            python3-pip python3-ply python3-pyelftools python3-setuptools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs unzip upx-ucl vim wget xmlto xxd xz-utils \
+            zlib1g-dev zstd
+          echo "════════ 依赖自检 ════════"
+          for c in gcc g++ make cmake ninja python3 pkg-config swig \
+                   dtc lld ld.lld re2c zstd ack; do
+            printf '%-12s %s\n' "$c" "$(command -v $c || echo '缺失')"
+          done
+          echo "gcc     : $(gcc --version | head -1)"
+          echo "python3 : $(python3 --version)"
+          ls /usr/include/yaml.h /usr/include/gnutls/gnutls.h >/dev/null 2>&1 \
+            && echo "头文件: yaml.h / gnutls.h 就位" || true
 
       # ═══════════════════════════════════════════════════════════
       # 2. 源码（coolsnowwolf/lede 或 immortalwrt/immortalwrt）
