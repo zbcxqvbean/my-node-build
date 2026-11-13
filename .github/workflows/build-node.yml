@@ -53,7 +53,7 @@ on:
           - "3"
           - "4"
       gen_index:
-        description: "是否生成 opkg 源索引（Packages/Packages.gz）"
+        description: "是否生成源索引（ipk→Packages/Packages.gz，apk→APKINDEX.tar.gz）"
         required: true
         default: true
         type: boolean
@@ -78,38 +78,70 @@ jobs:
 
     steps:
       # ═══════════════════════════════════════════════════════════
-      # 1. 主机依赖
-      #    = immortalwrt 官方 install-deps 清单（全量，不精简）
-      #      + coolsnowwolf/lede 额外项（libfuse-dev / libnsl-dev / xz-utils）
-      #      + nxhack README 要求（gcc-multilib / g++-multilib / libatomic1）
-      #    包名已按 Ubuntu 24.04 (noble) 实测校正：
-      #      gnutls-dev      是虚拟包 → 用实体名 libgnutls28-dev
-      #      libncurses5-dev / libncursesw5-dev 是 transitional → 用 libncurses-dev
-      #      libz-dev        由 zlib1g-dev 提供（已含）
-      #      mkisofs         由 genisoimage 提供（已含）
+      # 1. 主机依赖：按所选源码，用它自己的官方清单
+      #
+      #    coolsnowwolf/lede     → lede README 的 apt 清单
+      #    immortalwrt           → immortalwrt install-deps 的 apt 清单
+      #
+      #    两套清单原样保留，只做「Ubuntu 24.04 不存在该包名」的等价替换
+      #    （已在 noble 的 Packages 索引里逐个核对过）：
+      #      gnutls-dev                         不存在 → libgnutls28-dev
+      #      libz-dev                           不存在 → zlib1g-dev（清单本就有）
+      #      mkisofs                            不存在 → genisoimage
+      #      libncurses5-dev / libncursesw5-dev  前者不存在、后者仅虚拟 → libncurses-dev
+      #    另外双方都加 libatomic1（nxhack README 明确要求）。
       # ═══════════════════════════════════════════════════════════
       - name: 安装主机依赖
         timeout-minutes: 30   # 超过 30 分钟必是卡死，快速失败而非挂 5 小时
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          REPO="${{ github.event.inputs.source_repo }}"
+
+          # coolsnowwolf/lede README 原文清单（libncurses5-dev+libncursesw5-dev → libncurses-dev）
+          LEDE_DEPS=(
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison
+            build-essential bzip2 ccache clang cmake cpio curl
+            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext
+            genisoimage git gperf haveged help2man intltool libc6-dev-i386
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev
+            libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev
+            ninja-build p7zip p7zip-full patch pkgconf python3
+            python3-pyelftools python3-setuptools qemu-utils rsync scons
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip
+            vim wget xmlto xxd xz-utils zlib1g-dev
+          )
+
+          # immortalwrt install-deps 原文清单（gnutls-dev/libz-dev/mkisofs 已映射）
+          IMM_DEPS=(
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison
+            build-essential bzip2 ccache clang cmake cpio curl
+            device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib
+            g++-multilib git libgnutls28-dev gperf haveged help2man intltool
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev
+            libreadline-dev libssl-dev libtool libyaml-dev lld llvm lrzsz
+            genisoimage msmtp nano ninja-build p7zip p7zip-full patch pkgconf
+            python3 python3-pip python3-ply python3-docutils python3-pyelftools
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo
+            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          )
+
+          case "$REPO" in
+            immortalwrt/immortalwrt) DEPS=("${IMM_DEPS[@]}") ; DEPNAME="immortalwrt" ;;
+            *)                        DEPS=("${LEDE_DEPS[@]}") ; DEPNAME="coolsnowwolf/lede" ;;
+          esac
+          DEPS+=(libatomic1)   # nxhack 要求
+
+          # 去重（映射后可能重复，如 libncurses-dev / zlib1g-dev）
+          mapfile -t DEPS < <(printf '%s\n' "${DEPS[@]}" | awk 'NF && !seen[$0]++')
+
+          echo "════════ 使用 $DEPNAME 官方依赖清单，共 ${#DEPS[@]} 个包 ════════"
+
           APT="sudo -E apt-get -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
           $APT update
-          $APT install --no-install-recommends \
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl \
-            device-tree-compiler ecj fastjar flex gawk \
-            g++-multilib gcc-multilib genisoimage gettext git \
-            gperf haveged help2man intltool \
-            lib32gcc-s1 libatomic1 libc6-dev-i386 libelf-dev libfuse-dev \
-            libglib2.0-dev libgmp3-dev libgnutls28-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses-dev libnsl-dev libpython3-dev \
-            libreadline-dev libssl-dev libtool libyaml-dev \
-            lld llvm lrzsz msmtp nano ninja-build \
-            p7zip p7zip-full patch pkgconf python3 python3-docutils \
-            python3-pip python3-ply python3-pyelftools python3-setuptools \
-            qemu-utils re2c rsync scons squashfs-tools subversion swig \
-            texinfo uglifyjs unzip upx-ucl vim wget xmlto xxd xz-utils \
-            zlib1g-dev zstd
+          $APT install --no-install-recommends "${DEPS[@]}"
+
           echo "════════ 依赖自检 ════════"
           for c in gcc g++ make cmake ninja python3 pkg-config swig \
                    dtc lld ld.lld re2c zstd ack; do
@@ -178,20 +210,12 @@ jobs:
       - name: 写入板级配置
         working-directory: src
         run: |
-          # 强制出 ipk（opkg），不用 apk。
-          # immortalwrt master 的 config/Config-build.in 里 USE_APK 是 default y，
-          # 但 include/package-pack.mk 是双分支实现：
-          #   CONFIG_USE_APK 为空  → ipkg-build → <pkg>_<ver>_<arch>.ipk
-          #   CONFIG_USE_APK=y    → apk mkpkg  → <pkg>-<ver>.apk
-          # 所以显式关掉就能在 master 上继续出 ipk，装到 opkg 固件上。
           cat > .config <<'EOF'
           CONFIG_TARGET_ipq40xx=y
           CONFIG_TARGET_ipq40xx_generic=y
           CONFIG_TARGET_ipq40xx_generic_DEVICE_asus_rt-ac42u=y
 
           CONFIG_CCACHE=y
-
-          # CONFIG_USE_APK is not set
 
           CONFIG_FEED_packages=y
           CONFIG_FEED_luci=y
@@ -309,20 +333,18 @@ jobs:
             exit 1
           fi
 
-          # ② 必须是 ipk 模式（opkg 固件只能装 ipk）。
-          #    板级配置里已写死 "# CONFIG_USE_APK is not set"，
-          #    这里只做最终校验：如果它被 defconfig 又打开了，说明该源码
-          #    不支持 ipk 打包（或符号名变了），必须当场失败而不是白编几小时。
+          # ② 打包格式：完全按源码自身设定，不做任何干预。
+          #    lede / immortalwrt-24.10 → ipk（opkg）
+          #    immortalwrt master 等新分支 → apk（USE_APK default y）
+          #    只为后续收集/索引步骤记录实际格式，不改 .config。
           if grep -q "^CONFIG_USE_APK=y" .config; then
-            echo "❌ 仍然是 apk 模式，产物会是 .apk，opkg 固件装不了"
-            echo "---- 当前打包相关配置 ----"
-            grep -E "^CONFIG_USE_APK|^# CONFIG_USE_APK" .config || true
-            echo "---- 源码打包实现 ----"
-            ls -l include/package-ipkg.mk include/package-pack.mk 2>/dev/null || true
-            grep -n "PACK_\$(1):=" include/package-pack.mk 2>/dev/null | head -4 || true
-            exit 1
+            PKG_FORMAT=apk
+            echo "✅ 打包格式: apk（源码自身设定，产物 .apk）"
+          else
+            PKG_FORMAT=ipk
+            echo "✅ 打包格式: ipk（源码自身设定，产物 .ipk）"
           fi
-          echo "✅ 打包格式: ipk（CONFIG_USE_APK 未启用）"
+          echo "PKG_FORMAT=$PKG_FORMAT" >> "$GITHUB_ENV"
 
           echo "════════ 最终配置核对 ════════"
           grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
@@ -409,9 +431,9 @@ jobs:
           make package/feeds/packages/python3/host/compile -j${{ github.event.inputs.threads }} V=s || true
 
       # ═══════════════════════════════════════════════════════════
-      # 12. 编译 node ipk
+      # 12. 编译 node 包（产物格式由源码自身决定：ipk 或 apk）
       # ═══════════════════════════════════════════════════════════
-      - name: 编译 node ipk
+      - name: 编译 node 包
         working-directory: src
         run: |
           set -o pipefail
@@ -421,12 +443,15 @@ jobs:
           echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
 
       # ═══════════════════════════════════════════════════════════
-      # 13. 收集产物
+      # 13. 收集产物（自动适配 ipk / apk 两种格式）
+      #
+      #     ipk:  <pkg><ABI>_<ver>_<arch>.ipk     （lede、immortalwrt-24.10）
+      #     apk:  <pkg><ABI>-<ver>.apk            （immortalwrt master 等）
+      #     格式由前一步写入的 PKG_FORMAT 决定，完全跟随源码自身设定。
       #
       #     node 本体包名前缀 = ABI 号，随主版本变化：
       #       node127（22.x）/ node137（24.x）/ node147（26.x）
-      #     所以只能用 node<数字>_ 通配，绝不能写死 node137。
-      #     npm 固定叫 node-npm。
+      #     所以只能用 node<数字> 通配，绝不能写死 node137。
       #
       #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
       #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
@@ -437,86 +462,138 @@ jobs:
         run: |
           mkdir -p out
 
-          # 架构从 .config 读，避免两个源命名差异
           ARCH=$(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)
           [ -n "$ARCH" ] || ARCH=arm_cortex-a7_neon-vfpv4
-          echo "包架构: $ARCH"
-          PKGDIR=bin/packages/$ARCH/node
-          echo "════════ $PKGDIR 内容 ════════"
+          FMT="${PKG_FORMAT:-ipk}"
+          echo "包架构: $ARCH    打包格式: $FMT"
+
+          PKGDIR="bin/packages/$ARCH/node"
+          if [ ! -d "$PKGDIR" ]; then
+            echo "⚠ $PKGDIR 不存在，全局搜索 node 包所在目录"
+            hit=$(find bin/packages -maxdepth 3 -type f \
+                    \( -name 'node[0-9]*_*.ipk' -o -name 'node[0-9]*-*.apk' \) \
+                    2>/dev/null | head -1)
+            [ -n "$hit" ] && PKGDIR=$(dirname "$hit")
+          fi
+          echo "════════ 包目录: $PKGDIR ════════"
           ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
 
           shopt -s nullglob
-          NODE_IPKS=("$PKGDIR"/node[0-9]*_*.ipk)
-          NPM_IPKS=("$PKGDIR"/node-npm_*.ipk)
+          if [ "$FMT" = "apk" ]; then
+            NODE_PKGS=("$PKGDIR"/node[0-9]*-*.apk)
+            NPM_PKGS=("$PKGDIR"/node-npm-*.apk)
+          else
+            NODE_PKGS=("$PKGDIR"/node[0-9]*_*.ipk)
+            NPM_PKGS=("$PKGDIR"/node-npm_*.ipk)
+          fi
           shopt -u nullglob
 
-          if [ ${#NODE_IPKS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node<ABI>_*.ipk，目录实际内容："
+          if [ ${#NODE_PKGS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node<ABI> 本体包（格式 $FMT），目录实际内容："
             ls -lh "$PKGDIR"
             exit 1
           fi
-          if [ ${#NPM_IPKS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node-npm_*.ipk"
+          if [ ${#NPM_PKGS[@]} -eq 0 ]; then
+            echo "❌ 未找到 node-npm 包（格式 $FMT）"
             exit 1
           fi
-          cp -v "${NODE_IPKS[@]}" out/
-          cp -v "${NPM_IPKS[@]}" out/
+          cp -v "${NODE_PKGS[@]}" out/
+          cp -v "${NPM_PKGS[@]}" out/
 
           # 运行时依赖（包名来自 DEPENDS；版本号通配）
-          # libc_ 写死下划线，避免误匹配 libcares_ 等
-          for pat in "libstdcpp6_*" "libatomic1_*" "libgcc1_*" "libc_*" \
-                     "zlib_*" "libopenssl3_*" "libopenssl-conf_*" \
-                     "libopenssl-legacy_*" "libnghttp2-14_*" "libcares_*"; do
-            find bin/packages bin/targets -name "${pat}.ipk" \
-              -exec cp -v {} out/ \; 2>/dev/null || true
+          # ipk 用 _ 分隔、apk 用 - 分隔；libc 单独写，避免误匹配 libcares
+          for pat in libstdcpp6 libatomic1 libgcc1 libc zlib \
+                     libopenssl3 libopenssl-conf libopenssl-legacy \
+                     libnghttp2-14 libcares; do
+            if [ "$FMT" = "apk" ]; then
+              find bin/packages bin/targets -name "${pat}-*.apk" \
+                -exec cp -v {} out/ \; 2>/dev/null || true
+            else
+              find bin/packages bin/targets -name "${pat}_*.ipk" \
+                -exec cp -v {} out/ \; 2>/dev/null || true
+            fi
           done
 
           echo "════════ out/ ════════"
           ls -lh out/
 
+          # 判定某依赖是否已收集到（兼容两种扩展名）
+          have() {
+            if [ "$FMT" = "apk" ]; then
+              ls out/"$1"-*.apk > /dev/null 2>&1
+            else
+              ls out/"$1"_*.ipk > /dev/null 2>&1
+            fi
+          }
+
           # 硬校验：Makefile DEPENDS 里必有的六个
           for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
-            ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
+            have "$need" || { echo "❌ 缺依赖 $need"; exit 1; }
           done
           # 可选依赖：.config 里选中了就必须有产物
-          # （immortalwrt/openwrt 某些版本没有 libopenssl-legacy 这个包）
           for need in libopenssl-conf libopenssl-legacy; do
             if grep -q "^CONFIG_PACKAGE_${need}=y" .config; then
-              ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
+              have "$need" || { echo "❌ 缺依赖 $need"; exit 1; }
             fi
           done
 
-          NODE_FILE=$(basename "${NODE_IPKS[0]}")
-          # node137_24.22.2-1_arm_cortex-a7_neon-vfpv4.ipk
-          #   → ABI=137, 版本=24.22.2-1
-          # 不能用贪婪 sed（arch 里也有下划线，会截错）
-          NODE_ABI="${NODE_FILE#node}"
-          NODE_ABI="${NODE_ABI%%_*}"
-          NODE_VER="${NODE_FILE#node${NODE_ABI}_}"
-          NODE_VER="${NODE_VER%_${ARCH}.ipk}"
-          echo "✅ 收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
-          echo "node 本体: $NODE_FILE  (ABI=$NODE_ABI, version=$NODE_VER)"
-          sha256sum out/*.ipk
+          # 从真实文件名反解 ABI 与版本（架构名里也有下划线，不能用贪婪匹配）
+          NODE_FILE=$(basename "${NODE_PKGS[0]}")
+          if [ "$FMT" = "apk" ]; then
+            # node137-24.22.2-1.apk
+            _b="${NODE_FILE%.apk}"
+            NODE_ABI="${_b#node}"; NODE_ABI="${NODE_ABI%%-*}"
+            NODE_VER="${_b#node${NODE_ABI}-}"
+          else
+            # node137_24.22.2-1_arm_cortex-a7_neon-vfpv4.ipk
+            _b="${NODE_FILE%.ipk}"
+            NODE_ABI="${_b#node}"; NODE_ABI="${NODE_ABI%%_*}"
+            NODE_VER="${_b#node${NODE_ABI}_}"
+            NODE_VER="${NODE_VER%_${ARCH}}"
+          fi
 
-          # 把实际版本/ABI 写进环境，供 artifact 命名、Release 和索引使用
+          echo "✅ 收集完成，共 $(ls out/*.$FMT 2>/dev/null | wc -l) 个 .$FMT"
+          echo "node 本体: $NODE_FILE  (ABI=$NODE_ABI, version=$NODE_VER)"
+          sha256sum out/* 2>/dev/null || true
+
           {
             echo "NODE_VER=$NODE_VER"
             echo "NODE_ABI=$NODE_ABI"
           } >> "$GITHUB_ENV"
 
       # ═══════════════════════════════════════════════════════════
-      # 14. 生成 opkg 源索引（Packages / Packages.gz）
+      # 14. 生成源索引（跟随源码的打包格式）
+      #       ipk → opkg 的 Packages / Packages.gz（下面自带的解析器）
+      #       apk → apk-tools 的 APKINDEX.tar.gz（调 host apk index）
       #
-      #     两种 ipk 封装都要支持：
+      #     ipk 的两种封装都要支持：
       #       ① 新格式：整个 ipk 是 gzip tar，内含 ./control.tar.gz
-      #          （OpenWrt 24.10 及 lede 新 ipkg-build 的实际产物）
       #       ② 老格式：ar 归档，内含 control.tar.gz
       #     先看文件头魔数判断，避免 ar 报错直接中断。
       # ═══════════════════════════════════════════════════════════
-      - name: 生成 opkg 源索引
+      - name: 生成源索引
         if: github.event.inputs.gen_index == 'true'
         working-directory: src/out
         run: |
+          FMT="${PKG_FORMAT:-ipk}"
+          echo "打包格式: $FMT"
+
+          if [ "$FMT" = "apk" ]; then
+            echo "════════ apk 模式：生成 APKINDEX.tar.gz ════════"
+            APKBIN=../staging_dir/host/bin/apk
+            if [ -x "$APKBIN" ] && ls *.apk >/dev/null 2>&1; then
+              if "$APKBIN" index -o APKINDEX.tar.gz *.apk; then
+                ls -lh APKINDEX.tar.gz
+                echo "✅ apk 索引生成完成（apk 源目录放 APKINDEX.tar.gz + 全部 .apk）"
+              else
+                echo "⚠ apk index 执行失败，跳过索引（不影响直接装 .apk 文件）"
+              fi
+            else
+              echo "⚠ 未找到 host apk 工具或无 apk 包，跳过索引"
+            fi
+            exit 0
+          fi
+
           python3 <<'PYEOF'
           import glob, hashlib, io, os, subprocess, tarfile, traceback
 
@@ -654,17 +731,24 @@ jobs:
             - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || 'master（默认）' }}
             - node 主版本：${{ github.event.inputs.node_major }}.x（ABI ${{ env.NODE_ABI || '?' }}）
             - nxhack feed：${{ github.event.inputs.nxhack_branch }}
+            - 打包格式：${{ env.PKG_FORMAT || 'ipk' }}（跟随源码自身设定）
 
-            安装：opkg install node${{ env.NODE_ABI }}_*.ipk node-npm_*.ipk
-            （依赖包已随附；若本地 opkg 源已同步索引，可直接
-             opkg update && opkg install node${{ env.NODE_ABI }}）
+            安装（按你的固件格式选一种，依赖包已随附）：
+
+            - apk 固件：
+              `apk add --allow-untrusted node${{ env.NODE_ABI }}-*.apk node-npm-*.apk`
+            - ipk 固件：
+              `opkg install node${{ env.NODE_ABI }}_*.ipk node-npm_*.ipk`
+            - 已配好自建源：
+              apk → `APKINDEX.tar.gz` + 全部 .apk；opkg → `Packages` + `Packages.gz` + 全部 .ipk
+              之后 `apk update` 或 `opkg update`，再装 `node${{ env.NODE_ABI }}`
           files: |
             src/out/*
 
       # ═══════════════════════════════════════════════════════════
-      # 16. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
+      # 16. 上传：无论索引是否成功，产物都要传出来（不让 4 小时白跑）
       # ═══════════════════════════════════════════════════════════
-      - name: 上传 ipk + 索引
+      - name: 上传产物 + 索引
         if: always()
         uses: actions/upload-artifact@v4
         with:
