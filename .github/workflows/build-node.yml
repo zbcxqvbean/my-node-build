@@ -1,14 +1,32 @@
-name: Build node v24 ipk (ipq40xx / ASUS RT-AC42U / armv7)
+name: Build node ipk (ipq40xx / ASUS RT-AC42U / armv7)
 
 on:
   workflow_dispatch:
     inputs:
-      lede_ref:
-        description: "lede 分支或 commit（留空 = master）"
+      source_repo:
+        description: "OpenWrt 源码仓库（immortalwrt 建议用 openwrt-24.10 分支，master 已切 apk）"
+        required: true
+        default: "coolsnowwolf/lede"
+        type: choice
+        options:
+          - coolsnowwolf/lede
+          - immortalwrt/immortalwrt
+      source_ref:
+        description: "源码分支/tag（留空 = 默认：lede→master，immortalwrt→openwrt-24.10）"
         required: false
-        default: "master"
+        default: ""
+      node_major:
+        description: "node 主版本（20 仅 24.10 分支；26 仅 25.12/master；没有 23）"
+        required: true
+        default: "24"
+        type: choice
+        options:
+          - "20"
+          - "22"
+          - "24"
+          - "26"
       nxhack_branch:
-        description: "nxhack 分支（openwrt-24.10 适配 lede 5.10 内核）"
+        description: "nxhack 分支（需与源码匹配：openwrt-24.10 / openwrt-25.12 / master）"
         required: true
         default: "openwrt-24.10"
         type: choice
@@ -60,7 +78,7 @@ jobs:
 
     steps:
       # ═══════════════════════════════════════════════════════════
-      # 1. 主机依赖（lede 官方清单 + nxhack 额外要求）
+      # 1. 主机依赖（OpenWrt 官方清单 + nxhack 额外要求）
       #    nxhack README 明确要求：gcc-multilib / g++-multilib / libatomic
       # ═══════════════════════════════════════════════════════════
       - name: 安装主机依赖
@@ -84,22 +102,36 @@ jobs:
           echo "python3: $(python3 --version)"
 
       # ═══════════════════════════════════════════════════════════
-      # 2. lede 源码
+      # 2. 源码（coolsnowwolf/lede 或 immortalwrt/immortalwrt）
+      #    两个源目录结构、feeds 机制、ipq40xx 设备定义完全一致，
+      #    差别只在 repo 地址和默认分支。
       # ═══════════════════════════════════════════════════════════
-      - name: 拉取 coolsnowwolf/lede
+      - name: 拉取 OpenWrt 源码
         run: |
-          git clone https://github.com/coolsnowwolf/lede.git lede
-          cd lede
-          if [ -n "${{ github.event.inputs.lede_ref }}" ] && \
-             [ "${{ github.event.inputs.lede_ref }}" != "master" ]; then
-            git checkout "${{ github.event.inputs.lede_ref }}"
+          REPO="${{ github.event.inputs.source_repo }}"
+          REF="${{ github.event.inputs.source_ref }}"
+          if [ -z "$REF" ]; then
+            case "$REPO" in
+              immortalwrt/immortalwrt) REF="openwrt-24.10" ;;   # master 已切 apk，默认给 24.10
+              *)                       REF="master" ;;
+            esac
           fi
-          echo "== lede HEAD =="
+          echo "repo=$REPO  ref=$REF"
+          echo "SOURCE_TAG=$(echo "$REPO" | tr '/' '-')-$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
+
+          git clone "https://github.com/$REPO.git" src
+          cd src
+          git checkout "$REF"
+
+          echo "== HEAD =="
           git log -1 --format="%H  %cd  %s"
           echo "== 目标板内核版本 =="
           grep -E "KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER" target/linux/ipq40xx/Makefile || true
           echo "== 架构 =="
           grep -E "^ARCH:=|^CPU_TYPE:=|^CPU_SUBTYPE:=" target/linux/ipq40xx/Makefile || true
+          echo "== 打包格式 =="
+          if [ -f package/system/apk/Makefile ]; then echo "含 apk 支持"; fi
+          if [ -f package/system/opkg/Makefile ]; then echo "含 opkg 支持"; fi
 
       # ═══════════════════════════════════════════════════════════
       # 3. 缓存 dl（只缓存源码 tarball）
@@ -107,10 +139,10 @@ jobs:
       - name: 缓存 dl 源码包
         uses: actions/cache@v4
         with:
-          path: lede/dl
-          key: lede-dl-${{ hashFiles('lede/include/kernel-version.mk') }}-v4
+          path: src/dl
+          key: openwrt-dl-${{ hashFiles('src/include/version.mk') }}-v4
           restore-keys: |
-            lede-dl-
+            openwrt-dl-
 
       # ═══════════════════════════════════════════════════════════
       # 3.5 ccache（二次编译提速：node 及各依赖包的重编译命中缓存）
@@ -119,14 +151,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-node-${{ github.event.inputs.lede_ref }}-v1
+          key: ccache-node-${{ github.event.inputs.node_major }}-${{ hashFiles('src/include/version.mk') }}-v1
           restore-keys: ccache-node-
 
       # ═══════════════════════════════════════════════════════════
       # 4. 板级配置（只为确定目标架构 arm_cortex-a7_neon-vfpv4）
       # ═══════════════════════════════════════════════════════════
       - name: 写入板级配置
-        working-directory: lede
+        working-directory: src
         run: |
           cat > .config <<'EOF'
           CONFIG_TARGET_ipq40xx=y
@@ -141,18 +173,30 @@ jobs:
           CONFIG_FEED_telephony=y
           CONFIG_FEED_node=y
           EOF
+
+          # 两个源都必须有这台设备，否则 defconfig 会静默回落到 Generic，
+          # 虽然架构一样能编，但明确失败更省时间
+          if grep -q "asus_rt-ac42u" target/linux/ipq40xx/image/generic.mk; then
+            echo "✓ 设备定义存在: asus_rt-ac42u"
+          else
+            echo "❌ 该源码没有 asus_rt-ac42u 设备定义"
+            grep -E "define Device/asus" target/linux/ipq40xx/image/generic.mk || true
+            exit 1
+          fi
           echo "板级配置已写入"
 
       # ═══════════════════════════════════════════════════════════
       # 5. 官方 feeds
       # ═══════════════════════════════════════════════════════════
       - name: 安装官方 feeds
-        working-directory: lede
+        working-directory: src
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          echo "== lede 自带 node 就位 =="
-          ls -d package/feeds/packages/node
+          echo "== 源码自带 node 检查 =="
+          # lede / immortalwrt 的 packages feed 都有 node；即便没有也不影响
+          # （nxhack feed 会提供 node），所以这里只做提示不失败
+          ls -d package/feeds/packages/node 2>/dev/null || echo "（packages feed 无 node，将以 nxhack 为准）"
 
       # ═══════════════════════════════════════════════════════════
       # 6. 接入 nxhack —— 严格按官方 README 五步
@@ -167,7 +211,7 @@ jobs:
       #    注意：-p 后面是 feed 名（src-git 的第二个字段），不是包名。
       # ═══════════════════════════════════════════════════════════
       - name: 接入 nxhack node feed
-        working-directory: lede
+        working-directory: src
         run: |
           NXBRANCH="${{ github.event.inputs.nxhack_branch }}"
           echo "nxhack 分支: $NXBRANCH"
@@ -198,38 +242,72 @@ jobs:
           grep -E "PKG_VERSION" package/feeds/node/node/Makefile || true
 
       # ═══════════════════════════════════════════════════════════
-      # 7. 选定 node 24.x 并 defconfig（只做一次，之后绝不改 .config）
+      # 7. 选定 node 主版本并 defconfig（只做一次，之后绝不改 .config）
+      #
+      #    nxhack 的 node Makefile 用 choice 控制版本，且列表随分支/更新变化
+      #    （实测 2026-11）：
+      #      openwrt-24.10 : 20 / 22 / 24（默认 22）
+      #      openwrt-25.12 : 22 / 24 / 26（默认 24）
+      #      master        : 22 / 24 / 26（默认 24）
+      #    ABI 号决定产物包名前缀：
+      #      20.x→node115  22.x→node127  24.x→node137  26.x→node147
+      #    从来没有 23（奇数版本非 LTS）。
+      #    所以下面「选择版本」步骤必须校验，收集步骤必须动态匹配 node<ABI>_。
       # ═══════════════════════════════════════════════════════════
-      - name: 选择 node 24.x
-        working-directory: lede
+      - name: 选择 node 版本并 defconfig
+        working-directory: src
         run: |
-          cat >> .config <<'EOF'
-          CONFIG_NODEJS_24=y
+          MAJOR="${{ github.event.inputs.node_major }}"
+          echo "════════ 选择 node ${MAJOR}.x ════════"
+
+          cat >> .config <<EOF
+          CONFIG_NODEJS_${MAJOR}=y
           CONFIG_NODEJS_ICU_SMALL=y
           CONFIG_NODEJS_HOST_BIN=y
           CONFIG_PACKAGE_node=y
           CONFIG_PACKAGE_node-npm=y
-          # 显式钉死 openssl legacy provider（node 不直接依赖它，老版本 lede
-          # 会顺带编出来，新版本不会 —— 不钉死 artifact 就会少一个文件）
           CONFIG_PACKAGE_libopenssl-legacy=y
           EOF
 
           make defconfig
 
+          # ① 版本必须真的生效：feed 分支不支持该版本时，symbol 会被
+          #    defconfig 静默丢掉，回落默认 24 —— 那就会编错版本还看不出来
+          if ! grep -q "^CONFIG_NODEJS_${MAJOR}=y" .config; then
+            echo "❌ 当前 nxhack 分支不支持 node ${MAJOR}.x"
+            echo "---- .config 里的 NODEJS 选项 ----"
+            grep -E "^CONFIG_NODEJS_|^# CONFIG_NODEJS_" .config || true
+            echo "---- Makefile 支持的版本 ----"
+            grep -nE "config NODEJS_|default NODEJS_" package/feeds/node/node/Makefile || true
+            echo "提示：openwrt-24.10 → 20/22/24；openwrt-25.12 或 master → 22/24/26"
+            exit 1
+          fi
+
+          # ② OpenWrt 25.x 默认 apk，产物是 .apk，本工作流只处理 ipk
+          if grep -q "^CONFIG_USE_APK=y" .config; then
+            echo "❌ 该源码分支默认使用 apk（OpenWrt 25.x）"
+            echo "   本工作流产出 ipk（opkg），请改用 openwrt-24.10 分支/ref"
+            exit 1
+          fi
+
           echo "════════ 最终配置核对 ════════"
           grep -E "CONFIG_TARGET_BOARD=|CONFIG_TARGET_PROFILE=|CONFIG_TARGET_ARCH_PACKAGES=" .config || true
           grep -E "^CONFIG_NODEJS_" .config || echo "⚠ 无 NODEJS_ 项"
           grep -E "^CONFIG_PACKAGE_node" .config || echo "⚠ node 未选中"
+          grep -q "^CONFIG_PACKAGE_libopenssl-legacy=y" .config \
+            && echo "libopenssl-legacy: 已选中" \
+            || echo "libopenssl-legacy: 该源码没有此包，跳过"
 
-          echo "════════ Makefile 实际版本 ════════"
-          awk '/CONFIG_NODEJS_24/,/NODE_MODULE_VERSION/' package/feeds/node/node/Makefile | grep PKG_VERSION || true
+          echo "════════ Makefile 版本分支 ════════"
+          grep -nE "^PKG_VERSION|^NODE_MODULE_VERSION|^ifeq \(\\\$\(CONFIG_NODEJS_" \
+            package/feeds/node/node/Makefile || true
           echo "目标架构: $(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2 || echo '未知')"
 
       # ═══════════════════════════════════════════════════════════
       # 8. 下载源码包（node tarball 约 90MB）
       # ═══════════════════════════════════════════════════════════
       - name: 下载 node 源码包
-        working-directory: lede
+        working-directory: src
         run: |
           make package/feeds/node/node/download V=s || true
           echo "== dl 中的 node =="
@@ -241,7 +319,7 @@ jobs:
       #    日志落盘 /tmp/toolchain-build.log，失败时也能下载
       # ═══════════════════════════════════════════════════════════
       - name: 编译工具链
-        working-directory: lede
+        working-directory: src
         run: |
           # GitHub runner 的 CMake 是 4.x，会拒绝 cmake_minimum_required < 3.5 的老项目
           # （本次失败点：tools/dwarves）。设此变量让 CMake 4 兼容 3.5 策略。
@@ -274,7 +352,7 @@ jobs:
       #     这里先把内核编出来，kmod 才能正常打包。
       # ═══════════════════════════════════════════════════════════
       - name: 编译内核（kmod 依赖前置）
-        working-directory: lede
+        working-directory: src
         run: |
           ulimit -n 4096
           echo "════════ 内核编译开始（线程数 ${{ github.event.inputs.threads }}）: $(date -u +%H:%M:%S) ════════"
@@ -291,7 +369,7 @@ jobs:
       # 11. 预编译 host 依赖
       # ═══════════════════════════════════════════════════════════
       - name: 预编译 host 依赖
-        working-directory: lede
+        working-directory: src
         run: |
           ulimit -n 4096
           make package/feeds/packages/python3/host/compile -j${{ github.event.inputs.threads }} V=s || true
@@ -299,44 +377,48 @@ jobs:
       # ═══════════════════════════════════════════════════════════
       # 12. 编译 node ipk
       # ═══════════════════════════════════════════════════════════
-      - name: 编译 node 24.x ipk
-        working-directory: lede
+      - name: 编译 node ipk
+        working-directory: src
         run: |
           set -o pipefail
           ulimit -n 4096
-          echo "════════ node 编译开始（线程数 ${{ github.event.inputs.threads }}）: $(date -u +%H:%M:%S) ════════"
+          echo "════════ 目标: node ${{ github.event.inputs.node_major }}.x / 线程数 ${{ github.event.inputs.threads }} / 开始 $(date -u +%H:%M:%S) ════════"
           make package/feeds/node/node/compile -j${{ github.event.inputs.threads }} V=s 2>&1 | tee /tmp/node-build.log
           echo "════════ 结束: $(date -u +%H:%M:%S) ════════"
 
       # ═══════════════════════════════════════════════════════════
       # 13. 收集产物
       #
-      #     node 本体 + npm（nxhack Makefile 末尾仅定义这两个包）：
-      #       node137_<ver>-1_*.ipk    ← 版本号随 nxhack 更新，不可写死
-      #       node-npm_<ver>-1_*.ipk
-      #     所在目录：bin/packages/<arch>/node/
+      #     node 本体包名前缀 = ABI 号，随主版本变化：
+      #       node127（22.x）/ node137（24.x）/ node147（26.x）
+      #     所以只能用 node<数字>_ 通配，绝不能写死 node137。
+      #     npm 固定叫 node-npm。
       #
       #     完整运行时依赖（依据 = Makefile 的 DEPENDS 行 + 构建日志实证）：
       #       DEPENDS:= +libstdcpp +libopenssl +zlib +libnghttp2
       #                 +libcares +libatomic
       # ═══════════════════════════════════════════════════════════
       - name: 收集产物（node + npm + 全部运行时依赖）
-        working-directory: lede
+        working-directory: src
         run: |
           mkdir -p out
 
-          # node 本体 + npm：版本号用通配，不写死（nxhack 升级过 24.22.1→24.22.2）
-          PKGDIR=bin/packages/arm_cortex-a7_neon-vfpv4/node
+          # 架构从 .config 读，避免两个源命名差异
+          ARCH=$(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)
+          [ -n "$ARCH" ] || ARCH=arm_cortex-a7_neon-vfpv4
+          echo "包架构: $ARCH"
+          PKGDIR=bin/packages/$ARCH/node
           echo "════════ $PKGDIR 内容 ════════"
           ls -lh "$PKGDIR" || { echo "❌ 包目录不存在"; exit 1; }
 
           shopt -s nullglob
-          NODE_IPKS=("$PKGDIR"/node137_*.ipk)
+          NODE_IPKS=("$PKGDIR"/node[0-9]*_*.ipk)
           NPM_IPKS=("$PKGDIR"/node-npm_*.ipk)
           shopt -u nullglob
 
           if [ ${#NODE_IPKS[@]} -eq 0 ]; then
-            echo "❌ 未找到 node137_*.ipk"
+            echo "❌ 未找到 node<ABI>_*.ipk，目录实际内容："
+            ls -lh "$PKGDIR"
             exit 1
           fi
           if [ ${#NPM_IPKS[@]} -eq 0 ]; then
@@ -358,17 +440,35 @@ jobs:
           echo "════════ out/ ════════"
           ls -lh out/
 
-          # 硬校验：DEPENDS 清单里的每个依赖包都必须收集到
-          for need in libstdcpp6 libatomic1 zlib libopenssl3 libopenssl-conf \
-                      libopenssl-legacy libnghttp2-14 libcares; do
+          # 硬校验：Makefile DEPENDS 里必有的六个
+          for need in libstdcpp6 libatomic1 zlib libopenssl3 libnghttp2-14 libcares; do
             ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
           done
+          # 可选依赖：.config 里选中了就必须有产物
+          # （immortalwrt/openwrt 某些版本没有 libopenssl-legacy 这个包）
+          for need in libopenssl-conf libopenssl-legacy; do
+            if grep -q "^CONFIG_PACKAGE_${need}=y" .config; then
+              ls out/${need}_*.ipk > /dev/null 2>&1 || { echo "❌ 缺依赖 $need"; exit 1; }
+            fi
+          done
+
+          NODE_FILE=$(basename "${NODE_IPKS[0]}")
+          # node137_24.22.2-1_arm_cortex-a7_neon-vfpv4.ipk
+          #   → ABI=137, 版本=24.22.2-1
+          # 不能用贪婪 sed（arch 里也有下划线，会截错）
+          NODE_ABI="${NODE_FILE#node}"
+          NODE_ABI="${NODE_ABI%%_*}"
+          NODE_VER="${NODE_FILE#node${NODE_ABI}_}"
+          NODE_VER="${NODE_VER%_${ARCH}.ipk}"
           echo "✅ 收集完成，共 $(ls out/*.ipk | wc -l) 个 ipk"
-          echo "node 版本: $(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')"
+          echo "node 本体: $NODE_FILE  (ABI=$NODE_ABI, version=$NODE_VER)"
           sha256sum out/*.ipk
 
-          # 把实际版本号写进环境，供上传步骤命名 artifact
-          echo "NODE_VER=$(ls out/node137_*.ipk | sed 's/.*node137_\(.*\)_.*/\1/')" >> "$GITHUB_ENV"
+          # 把实际版本/ABI 写进环境，供 artifact 命名、Release 和索引使用
+          {
+            echo "NODE_VER=$NODE_VER"
+            echo "NODE_ABI=$NODE_ABI"
+          } >> "$GITHUB_ENV"
 
       # ═══════════════════════════════════════════════════════════
       # 14. 生成 opkg 源索引（Packages / Packages.gz）
@@ -381,7 +481,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════
       - name: 生成 opkg 源索引
         if: github.event.inputs.gen_index == 'true'
-        working-directory: lede/out
+        working-directory: src/out
         run: |
           python3 <<'PYEOF'
           import glob, hashlib, io, os, subprocess, tarfile, traceback
@@ -494,8 +594,8 @@ jobs:
           print("✓ 索引自校验通过：%d 条，字段齐全" % len(blocks))
 
           # 只有 node 本体读不出来才算致命；依赖包个别失败不影响
-          if not glob.glob("node137_*.ipk"):
-              raise SystemExit("❌ out/ 中没有 node137_*.ipk")
+          if not glob.glob("node[0-9]*_*.ipk"):
+              raise SystemExit("❌ out/ 中没有 node<ABI>_*.ipk")
           if failed:
               raise SystemExit("❌ 以下 ipk 无法解析: %s" % " ".join(failed))
           PYEOF
@@ -514,12 +614,18 @@ jobs:
           tag_name: node-v${{ env.NODE_VER || 'latest' }}
           name: node ${{ env.NODE_VER || 'latest' }} (arm_cortex-a7_neon-vfpv4)
           body: |
-            nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17（ipq40xx，arm_cortex-a7_neon-vfpv4）
+            nxhack node ${{ env.NODE_VER || 'latest' }}，目标设备 ASUS RT-AC42U / ACRH17
+            （ipq40xx，arm_cortex-a7_neon-vfpv4）
 
-            安装：opkg install node137_*.ipk node-npm_*.ipk
-            （依赖包已随附，如本地 opkg 源已同步索引可直接 opkg update && opkg install node137）
+            - 源码：${{ github.event.inputs.source_repo }} @ ${{ github.event.inputs.source_ref || '默认分支' }}
+            - node 主版本：${{ github.event.inputs.node_major }}.x（ABI ${{ env.NODE_ABI || '?' }}）
+            - nxhack feed：${{ github.event.inputs.nxhack_branch }}
+
+            安装：opkg install node${{ env.NODE_ABI }}_*.ipk node-npm_*.ipk
+            （依赖包已随附；若本地 opkg 源已同步索引，可直接
+             opkg update && opkg install node${{ env.NODE_ABI }}）
           files: |
-            lede/out/*
+            src/out/*
 
       # ═══════════════════════════════════════════════════════════
       # 16. 上传：无论索引是否成功，ipk 都要传出来（不让 4 小时白跑）
@@ -528,8 +634,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: node-${{ env.NODE_VER || 'latest' }}-arm_cortex-a7_neon-vfpv4
-          path: lede/out/
+          name: node-${{ env.NODE_VER || 'latest' }}-${{ env.SOURCE_TAG || 'src' }}-arm_cortex-a7_neon-vfpv4
+          path: src/out/
           if-no-files-found: error
           retention-days: 30
 
